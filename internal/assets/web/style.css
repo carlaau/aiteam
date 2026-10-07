@@ -1,0 +1,816 @@
+/*
+ * aiteam 看板样式（技术设计 §5.2 五区布局；B5-T1 骨架）
+ * 零外部资源红线：原生 CSS，不引任何 CDN/字体/框架资源。
+ * 布局：global-bar / main-row(project-tree + center-col(dialog-panel) + tab-area) / footer-status
+ * 五区纵向排布，中段川字三列 grid（b4-W2：树｜对话中列｜总线标签区）。
+ */
+
+/* ---------- 基础 ---------- */
+* { box-sizing: border-box; }
+
+/* ---------- 色板变量（b4-W1/AC5：亮色=迁移前现值逐字节等价；暗色=b4-T4 起步值） ----------
+   亮色 :root 为唯一真源；暗色在媒体查询块与 data-theme="dark" 块各声明一份（纯 CSS
+   无预处理器的标准实现形态，tech-design §5.3）；data-theme="light" 整组回写亮色
+   （系统暗+手动亮场景压过媒体查询——specificity 0,2,0 高于 0,1,0 且源序在后）。
+   变量定义行外零裸色值（grep 闸④：hex/rgba 仅存于变量定义行，注释亦禁写裸色值）。 */
+:root {
+  --bg: #f4f5f7;               /* body 底 / tab-btn:hover 底 */
+  --bg-card: #ffffff;          /* 三卡底 / tab-btn.active 底 / #dialog-close 底 */
+  --bg-subtle: #eef0f3;        /* footer/config 底 / status-tag·lv-normal·win-waiting·chip-delivered 底 / from-agent 气泡底 / dialog-log·dialog-head 分隔线 */
+  --bg-hover: #f7f8fa;         /* 会话行/栏目行/项目头 hover 底 */
+  --bg-selected: #eef3ff;      /* 会话行/栏目行选中底 / from-board 气泡底 */
+  --bg-input: #ffffff;         /* 对话输入框底（现隐式继承卡底，暗色需显式） */
+  --bar-bg: #ffffff;           /* ①状态条底（b4 修复批：亮色改白底——AC5 对 bar 三变量部分解冻，账本 2026-10-07 笔；暗色组不动） */
+  --bar-text: #1f2430;         /* ①状态条文字（同上：浅底深字） */
+  --bar-text-strong: #1f2430;  /* ①状态条 stat b（同上） */
+  --border: #e2e5ea;           /* 三卡边框 / tab 栏线 / 栏目行左线 / 表头线 / config 下线 / kind-other 左线 */
+  --border-faint: #f0f1f4;     /* 会话行/总线行/表格行分隔线 */
+  --border-strong: #cdd2da;    /* 输入框边框 / #dialog-close 边框 / kind-direct 左线 */
+  --text-1: #1f2430;           /* 主文字 / tab 激活 / 底栏 b / detail-title / config b */
+  --text-2: #6b7280;           /* 次文字 / tab 未激活 / zone-title / session-meta / 表头 */
+  --text-3: #98a0ad;           /* 占位字 / 时间戳 / caret / msg-details / msg-toggle / config-label / kind-other 字 / #dialog-close hover 边 */
+  --text-2-strong: #4b5563;    /* 中灰强调字：栏目行字 / lv-normal 字 / dialog-target / kind-direct 字 / msg-toggle hover 字（spec §2.1 对账底稿补漏——现值保真，AC5） */
+  --text-invert: #ffffff;      /* 发送钮字 / lv-block 字 / 未读角标字 / load-error 字 */
+  --accent: #3b66f5;           /* 发送钮底 / focus 边 / 选中左线 / 哨兵 pill 字 */
+  --accent-hover: #2f55d9;     /* 发送钮 hover 底 */
+  --danger: #d92d20;           /* lost / lost-value / load-error 底 / lv-block 底 / 未读角标底 / dialog-error 字 / 失联 pill 字 */
+  --ok: #12805c;               /* alive→在线 pill 字 / chip-done 字 / win-allowed 字 */
+  --warn-text: #b45309;        /* sentinel-hit 命中徽标字 */
+  --warn-text-strong: #b54708; /* lv-important 字（spec §2.1 对账底稿补漏——lv-important 现值与本变量成立值不同，各保真） */
+  --warn-bg: #fef0c7;          /* lv-important 底 */
+  --pill-ok-bg: #e3f5ee;       /* win-allowed 底 / chip-done 底 / 在线 pill 底 */
+  --pill-neutral-bg: var(--bg-subtle); /* status-tag / win-waiting / lv-normal / chip-delivered 底（spec 冻结复用不另设；var 引用随 --bg-subtle 级联，暗/亮覆写块无需重申本变量） */
+  --pill-lost-bg: #fde8e7;     /* 失联 pill 底（新配——原失联为纯文字红无底，W4 起 pill 化用） */
+  --pill-sentinel-bg: #e8effd; /* 哨兵在挂 pill 底（新配——蓝系，b3 绿→蓝视觉范式迁移，批内留痕） */
+  --fade-selected: rgba(238, 243, 255, 0); /* from-board 渐隐覆盖层端点（style.css:505 原值） */
+  --fade-subtle: rgba(238, 240, 243, 0);   /* from-agent 渐隐覆盖层端点（style.css:506 原值） */
+  --fade-card: rgba(255, 255, 255, 0);     /* kind-direct/other 渐隐覆盖层端点（style.css:508 原值） */
+}
+
+/* ---------- 暗色变量组·跟系统（AC8.1/PRD：prefers-color-scheme 纯 CSS 零 JS——
+   系统切换实时跟随；层级=纯黑底/深灰卡/高对比白字/灰次级/彩色 pill，b4-T4 起步值；
+   --pill-neutral-bg 有意不重申——var 引用随 --bg-subtle 本块级联，防误删 --bg-subtle/误补字面值） ---------- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0b0d;
+    --bg-card: #16181d;
+    --bg-subtle: #1d2026;
+    --bg-hover: #20242b;
+    --bg-selected: #1b2436;
+    --bg-input: #1d2026;
+    --bar-bg: #101216;
+    --bar-text: #d5d9e0;
+    --bar-text-strong: #ffffff;
+    --border: #2a2f3a;
+    --border-faint: #22262e;
+    --border-strong: #3a4150;
+    --text-1: #f3f4f6;
+    --text-2: #9aa3b2;
+    --text-3: #667082;
+    --text-2-strong: #b7c0d0;
+    --text-invert: #ffffff;
+    --accent: #5b7cfa;
+    --accent-hover: #7290fb;
+    --danger: #f0564a;
+    --ok: #3ecf9a;
+    --warn-text: #e0a458;
+    --warn-text-strong: #e0a458;
+    --warn-bg: #3a2d12;
+    --pill-ok-bg: #143024;
+    --pill-lost-bg: #3a1a17;
+    --pill-sentinel-bg: #1a2745;
+    --fade-selected: rgba(27, 36, 54, 0);
+    --fade-subtle: rgba(29, 32, 38, 0);
+    --fade-card: rgba(22, 24, 29, 0);
+  }
+}
+
+/* ---------- 手动暗色覆写（◐ 循环 dark 态）：与媒体查询块同值各声明一份
+   （tech-design §5.3 冻结标准形态——纯 CSS 无变量级 mixin；
+   --pill-neutral-bg 有意不重申——var 引用随 --bg-subtle 本块级联，防误删 --bg-subtle/误补字面值） ---------- */
+:root[data-theme="dark"] {
+  --bg: #0a0b0d;
+  --bg-card: #16181d;
+  --bg-subtle: #1d2026;
+  --bg-hover: #20242b;
+  --bg-selected: #1b2436;
+  --bg-input: #1d2026;
+  --bar-bg: #101216;
+  --bar-text: #d5d9e0;
+  --bar-text-strong: #ffffff;
+  --border: #2a2f3a;
+  --border-faint: #22262e;
+  --border-strong: #3a4150;
+  --text-1: #f3f4f6;
+  --text-2: #9aa3b2;
+  --text-3: #667082;
+  --text-2-strong: #b7c0d0;
+  --text-invert: #ffffff;
+  --accent: #5b7cfa;
+  --accent-hover: #7290fb;
+  --danger: #f0564a;
+  --ok: #3ecf9a;
+  --warn-text: #e0a458;
+  --warn-text-strong: #e0a458;
+  --warn-bg: #3a2d12;
+  --pill-ok-bg: #143024;
+  --pill-lost-bg: #3a1a17;
+  --pill-sentinel-bg: #1a2745;
+  --fade-selected: rgba(27, 36, 54, 0);
+  --fade-subtle: rgba(29, 32, 38, 0);
+  --fade-card: rgba(22, 24, 29, 0);
+}
+
+/* ---------- 手动亮色覆写（◐ 循环 light 态）：整组回写亮色现值——系统暗+
+   手动亮时压过媒体查询（specificity 0,2,0 且源序在后；
+   --pill-neutral-bg 有意不重申——var 引用随 --bg-subtle 本块级联，防误删 --bg-subtle/误补字面值） ---------- */
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --bg-card: #ffffff;
+  --bg-subtle: #eef0f3;
+  --bg-hover: #f7f8fa;
+  --bg-selected: #eef3ff;
+  --bg-input: #ffffff;
+  --bar-bg: #ffffff;
+  --bar-text: #1f2430;
+  --bar-text-strong: #1f2430;
+  --border: #e2e5ea;
+  --border-faint: #f0f1f4;
+  --border-strong: #cdd2da;
+  --text-1: #1f2430;
+  --text-2: #6b7280;
+  --text-3: #98a0ad;
+  --text-2-strong: #4b5563;
+  --text-invert: #ffffff;
+  --accent: #3b66f5;
+  --accent-hover: #2f55d9;
+  --danger: #d92d20;
+  --ok: #12805c;
+  --warn-text: #b45309;
+  --warn-text-strong: #b54708;
+  --warn-bg: #fef0c7;
+  --pill-ok-bg: #e3f5ee;
+  --pill-lost-bg: #fde8e7;
+  --pill-sentinel-bg: #e8effd;
+  --fade-selected: rgba(238, 243, 255, 0);
+  --fade-subtle: rgba(238, 240, 243, 0);
+  --fade-card: rgba(255, 255, 255, 0);
+}
+
+/* 主题切换钮（b4-W1/FR8）：①状态条右端，跟系统→亮→暗循环 */
+.theme-toggle {
+  margin-left: auto;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--bar-text);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+}
+.theme-toggle:hover { border-color: var(--bar-text); }
+
+body {
+  margin: 0;
+  font-family: system-ui, "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  color: var(--text-1);
+  background: var(--bg);
+  /* 五区纵向：视口内撑满，各区内部自行滚动 */
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+b { font-weight: 600; }
+
+.placeholder { color: var(--text-3); font-style: italic; }
+.zone-title {
+  margin: 8px 0 4px;
+  font-size: 12px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+/* ---------- 失联红标（AC14.2：sessions[].alive=false → 红色） ---------- */
+.lost { color: var(--danger); font-weight: 600; }
+.lost-value { color: var(--danger); }
+
+/* ---------- ① 全局状态条 ---------- */
+.global-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--bar-bg);
+  color: var(--bar-text);
+  border-bottom: 1px solid var(--border); /* b4 修复批：白底后与内容区视觉区隔（线色取 --border 级联暗色自动跟随） */
+  flex: none;
+}
+.global-bar .brand { font-weight: 700; margin-right: 8px; }
+.global-bar .stat b { margin-left: 4px; color: var(--bar-text-strong); }
+/* 级联补丁：上行的 .global-bar .stat b 白色（specificity 0,2,1）压过 .lost/
+   .lost-value（0,1,0），#stat-lost 红显会永久失效——同权重夺回（AC14.2；
+   同款修法见下方会话行 .lost 覆写） */
+.global-bar .stat b.lost,
+.global-bar .stat b.lost-value { color: var(--danger); }
+
+/* ---------- 中段：② 左栏 + 中列对话轨道 + ③ 标签区（b4-W2 川字三列） ---------- */
+.main-row {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 260px minmax(340px, 1fr) 1.5fr; /* b4-W2 川字：树｜对话中列（Q4 冻结 340px 下限）｜总线（吃剩余宽度且宽于中列——信息密度大） */
+  gap: 12px;
+  padding: 12px 16px;
+  min-height: 0; /* 允许子项滚动收缩 */
+}
+
+/* ② 项目-栏目树 + 会话心跳面 */
+.project-tree {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.tree-body { margin-bottom: 12px; }
+.session-row {
+  display: block; /* 两行制容器（子行自带 flex） */
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-faint);
+  cursor: pointer;
+}
+.session-row:hover { background: var(--bg-hover); }
+.session-row.selected { background: var(--bg-selected); }
+.session-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.session-sub {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+.session-rel { color: var(--text-3); font-size: 11px; font-weight: 400; }
+
+/* ③ 标签区四 tab */
+.tab-area {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.tab-btn {
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: none;
+  padding: 6px 14px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  color: var(--text-2);
+  font-size: 14px;
+}
+.tab-btn:hover { color: var(--text-1); background: var(--bg); }
+.tab-btn.active {
+  background: var(--bg-card);
+  border-color: var(--border);
+  color: var(--text-1);
+  font-weight: 600;
+  margin-bottom: -1px; /* 压住底边线 */
+}
+.tab-pane {
+  display: none;
+  padding: 12px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.tab-pane.active { display: block; }
+
+/* 中列（b4-W2 川字）：对话+发送纵列轨道 */
+#center-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;  /* grid 子项收缩防线（375px 无横向滚动，W5 收口） */
+  min-height: 0;
+}
+
+/* ---------- ④ 对话面板（全页唯一表单；b4-W2 迁入中列——面板填满轨道高，
+   .dialog-form flex:none 恒在轨道底部=AC1 发送框常驻可见；旧 240px 定高条清退） ---------- */
+.dialog-panel {
+  flex: 1 1 auto;
+  min-height: 0; /* 弹性卡收缩防线：不设则 content size 托底、长对话流爆版（同 .tab-pane/.project-tree 惯例） */
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+}
+.dialog-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--bg-subtle);
+}
+.dialog-form {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  flex: none;
+}
+.dialog-form input[type="text"] {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-input);
+  font-size: 14px;
+}
+.dialog-form input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.dialog-form button[type="submit"] {
+  padding: 6px 18px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--text-invert);
+  font-size: 14px;
+  cursor: pointer;
+}
+.dialog-form button[type="submit"]:hover { background: var(--accent-hover); }
+
+/* ---------- ⑤ 底栏 ---------- */
+.footer-status {
+  flex: none;
+  display: flex;
+  gap: 20px;
+  padding: 6px 16px;
+  color: var(--text-2);
+  font-size: 12px;
+  background: var(--bg-subtle);
+}
+.footer-status b { color: var(--text-1); }
+
+/* ==================== 以下为 B5-3 渲染增量 ==================== */
+
+/* ---------- 顶部失败提示条（fetch 失败兜底：不白屏不静默不弹窗） ---------- */
+.load-error {
+  flex: none;
+  background: var(--danger);
+  color: var(--text-invert);
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.load-error[hidden] { display: none; } /* 显式声明防 class display 覆盖 hidden 语义 */
+
+/* ---------- ② 项目-栏目树 ---------- */
+.tree-project { margin-bottom: 8px; }
+.tree-project-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+}
+.tree-column-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px;
+  border-left: 2px solid var(--border);
+  margin-left: 6px;
+  cursor: pointer;
+  color: var(--text-2-strong);
+}
+.tree-column-row:hover { background: var(--bg-hover); }
+.tree-column-row.selected { background: var(--bg-selected); border-left-color: var(--accent); }
+
+/* 状态小标签（项目/栏目的 status 原样展示） */
+.status-tag {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--pill-neutral-bg);
+  color: var(--text-2);
+  flex: none;
+}
+.session-meta { color: var(--text-2); font-size: 12px; }
+
+/* 状态 pill（b4-W4：b3 徽标升级 pill 视觉——在线绿/失联红/哨兵在挂蓝；文案语义零变；
+   哨兵在挂 pill 与 .sentinel-hit 命中徽标两语义并存不合并） */
+.pill {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  font-weight: 600;
+  flex: none;
+}
+.pill-ok { background: var(--pill-ok-bg); color: var(--ok); }
+.pill-lost { background: var(--pill-lost-bg); color: var(--danger); }
+.pill-sentinel { background: var(--pill-sentinel-bg); color: var(--accent-hover); } /* 暗色对比度不足 AA，取 accent-hover 亮一档（b4-T4 批内微调留痕） */
+.sentinel-hit { color: var(--warn-text); font-size: 11px; } /* 两行制下自据第三微行（b3 段逐字保留约束） */
+.session-row.lost b, .session-row.lost .session-meta { color: inherit; }
+
+/* ---------- ③ 总线消息流（AC14.3：分级徽标 block 最醒目） ---------- */
+.bus-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--border-faint);
+}
+.bus-seq { color: var(--text-3); font-size: 12px; flex: none; }
+.bus-time { color: var(--text-3); font-size: 12px; flex: none; }
+.bus-body { overflow-wrap: anywhere; }
+.badge {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  font-weight: 600;
+}
+.lv-normal { background: var(--pill-neutral-bg); color: var(--text-2-strong); }
+.lv-important { background: var(--warn-bg); color: var(--warn-text-strong); }
+.lv-block { background: var(--danger); color: var(--text-invert); }
+
+/* ---------- ③ 数据表（资源分组/时间窗矩阵/栏目明细共用） ---------- */
+.detail-title {
+  margin: 10px 0 6px;
+  font-size: 13px;
+  color: var(--text-1);
+}
+.detail-title:first-child { margin-top: 0; }
+.detail-asof { color: var(--text-3); font-size: 12px; margin: 0 0 8px; }
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border-faint);
+}
+.data-table th {
+  color: var(--text-2);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* 时间窗状态：allowed 绿 / waiting 灰（FR3） */
+.win-allowed {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  background: var(--pill-ok-bg);
+  color: var(--ok);
+  font-weight: 600;
+}
+.win-waiting {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  background: var(--pill-neutral-bg);
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* ==================== 以下为 B5-4 对话面板增量 ==================== */
+
+/* ---------- ④ 头部（目标会话标识 + 关闭按钮）与错误槽 ---------- */
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--bg-subtle);
+  flex: none;
+}
+.dialog-target {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#dialog-close {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-2);
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+}
+#dialog-close:hover { color: var(--text-1); border-color: var(--text-3); }
+#dialog-close[hidden] { display: none; } /* 显式声明防后续 class display 覆盖 hidden */
+.dialog-error {
+  margin: 0;
+  padding: 4px 12px 0;
+  color: var(--danger);
+  font-size: 12px;
+  flex: none;
+}
+.dialog-error[hidden] { display: none; }
+
+/* ---------- ④ 对话流双侧气泡（AC15：from_board=true 看板侧右 / false agent 左） ---------- */
+/* 级联补丁：log 原规则是块容器，此处改纵列 flex——子项 align-self 才能分侧 */
+.dialog-log { display: flex; flex-direction: column; }
+.msg-row { max-width: 78%; margin: 5px 0; }
+.msg-row.from-board { align-self: flex-end; text-align: right; }
+.msg-row.from-agent { align-self: flex-start; }
+.msg-body {
+  display: inline-block;
+  text-align: left;          /* 气泡内正文恒左读，右对齐只作用于 meta 行 */
+  white-space: pre-wrap;     /* 多行消息保换行 */
+  overflow-wrap: anywhere;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.from-board .msg-body { background: var(--bg-selected); }
+.from-agent .msg-body { background: var(--bg-subtle); }
+
+/* ==================== 以下为 B5-6 配置展示区增量 ==================== */
+
+/* ---------- 配置展示区（只读：①区下方一行，三阈值+时间窗概览） ----------
+   浅灰次行对齐 footer-status 风格（区别于①深色主条——概览附属信息降一级视觉
+   权重）；.stat 槽位结构与 global-bar 同款。纯文本展示零控件（AC23.4）。 */
+.config-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 5px 16px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.config-bar .config-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-3);
+}
+.config-bar .stat b { margin-left: 4px; color: var(--text-1); }
+
+/* ==================== 以下为 b3-W3 ②区三层树增量 ==================== */
+
+/* ---------- ② 三层树（项目→栏目→会话行）：折叠指示/第三层缩进/空态/四件套 ----------
+   全部追加式：既有块零改动，窄栏布局冲突以同选择器级联补丁收口（.dialog-log
+   级联补丁先例）。折叠=容器 .collapsed > .tree-children display:none（纯 class
+   切换，不落 localStorage——5s 整树重绘的折叠态记忆在 app.js 运行时 Set）。 */
+
+/* 折叠指示符：默认全展开（▶ 旋转向下）；.collapsed 回正（指向右=可展开） */
+.tree-caret {
+  display: inline-block;
+  width: 12px;
+  flex: none;
+  font-size: 10px;
+  color: var(--text-3);
+  transform: rotate(90deg);
+}
+.tree-project.collapsed .tree-caret,
+.tree-column.collapsed .tree-caret { transform: none; }
+.tree-project.collapsed > .tree-children,
+.tree-column.collapsed > .tree-children { display: none; }
+
+/* 级联补丁：折叠件入行后 space-between 三子项会把名称挤到居中——改左聚，
+   status-tag 以 margin-left:auto 保持右对齐（原两子项视觉不变） */
+.tree-project-head, .tree-column-row { justify-content: flex-start; }
+.tree-project-head .status-tag, .tree-column-row .status-tag { margin-left: auto; }
+
+/* 折叠可点面：项目头整行可点（无点选语义冲突）；栏目行折叠只认指示符
+   （行点选=selectColumn 既有动线），hover 只上项目头 */
+.tree-project-head { cursor: pointer; }
+.tree-project-head:hover { background: var(--bg-hover); }
+
+/* 第三层缩进：会话行/空态占位挂在栏目节点 children 下 */
+.tree-column > .tree-children { margin-left: 18px; }
+
+/* 空态占位行（AC1.3）：无会话栏目/无栏目项目/全空树下的灰字占位 */
+.tree-empty-row { padding: 2px 8px; font-size: 12px; }
+
+/* 四件套之四 未读角标：红底白字最醒目（AC14.3 block 同级），0 不渲染节点 */
+.unread-badge {
+  flex: none;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: var(--text-invert);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* ==================== 以下为 b3-W4 对话面板增量 ==================== */
+
+/* ---------- direct 合流行（AC4.3 kind 分支样式判据面） ----------
+   kind=direct 走 CLI 侧样式行（非气泡）：等宽字体+左侧竖线的终端引用块观感，与
+   上方既有块 chat 双侧气泡（board 右/agent 左，零回归）视觉可区分；行通栏展开
+   （.msg-row 78% 上限仅气泡行语义）。其余 kind（receipt 等理论不进流，防御兜底）
+   同构灰态 .kind-other */
+.msg-row.kind-direct, .msg-row.kind-other {
+  align-self: stretch;
+  max-width: 100%;
+  text-align: left;
+}
+.kind-direct .msg-body, .kind-other .msg-body {
+  background: transparent;
+  border-radius: 0;
+  padding: 2px 8px;
+  border-left: 2px solid var(--border-strong);
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
+  color: var(--text-2-strong);
+}
+.kind-other .msg-body { border-left-color: var(--border); color: var(--text-3); }
+
+/* ---------- 行上操作区（超长折叠切换+两态 chip） ----------
+   11px 灰字裸文本按钮——原「详情」切换钮已随 dialog-meta-1 清退（详情行改常驻，
+   见下节）；board 侧行 text-align:right 已从 .msg-row.from-board 继承，
+   按钮/chip 自然右聚 */
+.msg-actions { margin-top: 2px; }
+.msg-actions > * + * { margin-left: 8px; } /* 相邻控件间距（折叠钮/chip） */
+.msg-toggle {
+  display: inline-block;
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.msg-toggle:hover { color: var(--text-2-strong); text-decoration: underline; }
+
+/* ---------- 行内详情常驻（seq/created_at/from 三键，dialog-meta-1：免点开直达） ---------- */
+.msg-details { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+/* ---------- 超长正文折叠（>2KB UTF-8 字节默认收起，§5.2） ----------
+   max-height+渐隐收口；渐隐目标色随行形态取各自底色（气泡双色沿用既有块取值/
+   CLI 行白底），::after 覆盖层不拦截点击（pointer-events:none） */
+.msg-body.msg-folded {
+  max-height: 132px;
+  overflow: hidden;
+  position: relative;
+}
+.msg-folded::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 28px;
+  pointer-events: none;
+}
+.from-board .msg-folded::after { background: linear-gradient(var(--fade-selected), var(--bg-selected)); }
+.from-agent .msg-folded::after { background: linear-gradient(var(--fade-subtle), var(--bg-subtle)); }
+.kind-direct .msg-folded::after, .kind-other .msg-folded::after {
+  background: linear-gradient(var(--fade-card), var(--bg-card));
+}
+
+/* ---------- 两态 chip（FR6 结构面，仅 from_board=true 行挂） ----------
+   色板沿用既有 .win-allowed/.win-waiting 对（绿=已处理/灰=已投递）；翻拍只认当轮
+   positions.dialog 数据（无乐观翻转）；样式微调归 b4 */
+.chip {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  font-weight: 600;
+}
+.chip-delivered { background: var(--pill-neutral-bg); color: var(--text-2); }
+.chip-done { background: var(--pill-ok-bg); color: var(--ok); }
+
+/* ==================== 以下为 b4-W4 空态引导+会话行两行制增量 ==================== */
+
+/* 空态引导（b4-W4/AC6）：#dialog-log 内纵向居中；树空态同用两级文案 */
+.empty-guide {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-height: 160px;
+  padding: 24px 16px;
+  text-align: center;
+}
+.empty-guide-main { margin: 0; font-size: 14px; font-weight: 600; color: var(--text-2); }
+.empty-guide-sub { margin: 0; font-size: 12px; color: var(--text-3); }
+.tree-empty-guide { padding: 16px 12px; text-align: center; }
+.tree-empty-guide .empty-guide-main { font-size: 13px; }
+.tree-empty-guide .empty-guide-sub { margin-top: 4px; }
+
+/* ==================== 以下为 b4-W3 移动两页导航增量 ==================== */
+
+/* 移动分段控件：桌面恒隐（AC1 桌面无导航概念——路由类在桌面媒体查询内不被消费）；
+   移动显隐规则在下方媒体查询段按 body[data-route] 给出 */
+#m-home-nav {
+  display: none;
+  gap: 4px;
+  padding: 8px 16px 0;
+}
+.m-view-btn {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-2);
+  font-size: 14px;
+  padding: 8px 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.m-view-btn.active { color: var(--text-1); font-weight: 600; border-color: var(--accent); }
+
+/* ---------- 断点双向：桌面=base 川字（≥1100px），移动两页（<1100px） ----------
+   1099.98 与桌面 min-width:1100px 互补（0.98 写法防小数视口缝隙）；断点 1100px
+   =需求分析 Q6 冻结（b4-T1 裁定，PRD 768 字面量勘误随 W6 执行）。 */
+@media (max-width: 1099.98px) {
+  /* 川字改单列：三子件按路由显隐（display:none 子件不占轨） */
+  .main-row {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr); /* 唯一可见子件满高（树/tab 内滚、会话页对话流撑满） */
+  }
+
+  /* 主页（board）：会话页=树 / 总线页=tab 区（data-mview 二选一，缺省=会话页）；
+     对话中列隐藏（选中保持、3s 轮询继续，仅面板不可见） */
+  body[data-route="board"] #m-home-nav { display: flex; }
+  body[data-route="board"] #center-col { display: none; }
+  body[data-route="board"][data-mview="data"] #project-tree { display: none; }
+  body[data-route="board"]:not([data-mview="data"]) #tab-area { display: none; }
+
+  /* 会话页：中列满屏，树/tab/分段控件隐藏（AC3 对话流撑满+发送框贴底——
+     .dialog-form flex:none 恒在 #center-col 轨道底） */
+  body[data-route="session"] #project-tree,
+  body[data-route="session"] #tab-area,
+  body[data-route="session"] #m-home-nav { display: none; }
+
+  /* 会话页专注化（b4 修复批）：系统区块全隐藏——①状态条（含 ◐ 主题钮所在行）
+     +运行配置区+底部状态条，只留会话头+对话流+发送框满屏贴底；
+     桌面（≥1100）与手机主页（data-route=board）零变化 */
+  body[data-route="session"] #global-bar,
+  body[data-route="session"] #config-bar,
+  body[data-route="session"] #footer-status { display: none; }
+
+  /* 卡片化树（W4③）：项目=卡容器、卡头=项目名+状态 tag+折叠 caret（b3 折叠
+     交互零变——collapsedTreeNodes 机制不碰）；卡内=栏目组+会话行 */
+  .tree-project {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+  }
+  .tree-project-head { padding: 6px 4px; }
+
+  /* 触控热区（b4-W5：spec 冻结 min-height 44px——padding 与 min-height 双轨，实测口径） */
+  .tab-btn { padding: 10px 14px; min-height: 44px; }
+  .session-row { padding: 10px 8px; }
+  .m-view-btn { padding: 10px 0; min-height: 44px; }
+  .theme-toggle { padding: 10px 12px; min-height: 44px; }
+  #dialog-send { padding: 10px 18px; min-height: 44px; }
+  #dialog-close { padding: 8px 14px; min-height: 44px; }
+
+  /* 横向溢出防线（AC7.2：375px body.scrollWidth ≤ viewport——grid/flex 子项
+     min-width:0 + 换行兜底；overflow-wrap:anywhere 正文既有规则延续） */
+  .global-bar { flex-wrap: wrap; gap: 4px 12px; }
+  .footer-status { flex-wrap: wrap; gap: 2px 12px; }
+  .main-row > * { min-width: 0; }
+  .dialog-form input[type="text"] { min-width: 0; }
+  .bus-body { min-width: 0; }
+  /* 窄档总线行：行内剩余空间不足 170px 时正文整行换行承载（防 min-width:0
+     收缩出 1 字列退化——W5 溢出防线收口，走查发现） */
+  .bus-row { flex-wrap: wrap; }
+  .bus-body { flex: 1 1 170px; }
+  .session-main b, .session-meta, .tree-project-head, .tree-column-row { overflow-wrap: anywhere; } /* 长会话名/树名无空格串撑爆内滚防线（审查实测 300 字符名撑出树横向滚动） */
+}

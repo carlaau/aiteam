@@ -1,0 +1,73 @@
+# aiteam CI 工作流
+#
+# 结构：三个 job 相互独立并行跑，无依赖关系：
+#   1. build   —— 构建矩阵（ubuntu + windows）：build / vet / test
+#   2. race    —— 竞态检测（仅 ubuntu）：go test -race
+#      背景：Windows 本机常无 gcc 工具链不可跑 -race（modernc.org/sqlite 纯 Go
+#      无 CGO 不碍事，-race 需 cgo 工具链），故在 CI Linux 环境复验。
+#   3. sanitize—— 脱敏巡检（仅 ubuntu）：bash scripts/check-sanitize.sh
+#      口径说明：本仓白名单已清空，默认口径即全量扫描，必须 PASS 退出 0。
+#
+# 精简纪律（YAGNI）：不加缓存/通知/发布等超范围步骤。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ── job 1：构建矩阵（双系统腿） ─────────────────────────────────────────
+  build:
+    name: Build / Vet / Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go（版本与 go.mod 对齐：1.22）
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: 编译全部包
+        run: go build ./...
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 跑全部测试
+        run: go test ./...
+
+  # ── job 2：竞态检测（仅 ubuntu，独立于矩阵不阻塞） ─────────────────────
+  race:
+    name: Race Detector (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go（版本与 go.mod 对齐：1.22）
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # 本机无 gcc 跑不了的 -race，在 CI Linux 环境复验
+      - name: 竞态检测测试
+        run: go test -race ./...
+
+  # ── job 3：脱敏巡检（仅 ubuntu，默认口径=全量扫描） ────────────────────
+  sanitize:
+    name: Sanitize Check (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 本仓白名单已清空：默认口径即全量扫描，必须 PASS 退出 0
+      - name: 脱敏检查（默认口径，非 strict）
+        run: bash scripts/check-sanitize.sh

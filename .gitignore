@@ -1,0 +1,36 @@
+# 二进制
+*.exe
+*.exe~
+aiteam-server
+dist/
+
+# 数据文件（SQLite 开箱即用，库文件不入库）
+*.db
+*.sqlite
+*.db-wal
+*.db-shm
+
+# 运行态
+*.consumed
+*.watch.lock/
+*.log
+
+# aiteam 接入产物（仓级连接配置与 onboarding 上手文件入库共享；send 镜像审计行=本地运行态，忽略）
+.aiteam/*
+!.aiteam/cli.json
+!.aiteam/onboarding.md
+
+# 脱敏校准（内部项目名 pattern=本地敏感配置，不入库——机制见 scripts/check-sanitize.sh 头部口径）
+scripts/sanitize-patterns.local
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# 前端构建（看板）
+node_modules/
+
+# worktrees（AI 隔离工作区）
+.worktrees/

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<!--
+  aiteam 看板单页骨架（技术设计 §5.2 五区布局 / FR14 看板；B5-T1）
+  零构建工具链（A10 排除项：无 npm/框架/SSE/WebSocket）——原生 HTML，
+  经 embed.FS 进二进制（仓根 web.go）。数据渲染与轮询归 B5-3~B5-5，
+  本页仅骨架：五区锚点 + 中段川字三列（树｜对话中列｜标签区，b4-W2）
+  + 全页唯一表单（对话输入框，AC14.5）。
+  零外部资源红线：script/link 仅指向本仓 /app.js、/dialog.js、/style.css；
+  双 defer 按文档序执行——app.js 在前供工具函数，dialog.js 在后自启对话面板。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>aiteam 看板</title>
+  <!-- data: 空 icon 压制浏览器自动请求 /favicon.ico 的 404 控制台噪音（零外部资源红线内） -->
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- 移动两页导航（b4-W3）：主页内「会话｜总线」两页内 tab。显隐全由 CSS 控制——
+       桌面 display:none，移动按 body[data-route] 显隐（不加 hidden 属性防状态竞写）；
+       默认会话视图=active 预置（body[data-mview] 缺省即会话页）；tab 态内存态不上 hash -->
+  <nav id="m-home-nav" class="m-home-nav">
+    <button type="button" data-mview-btn="sessions" class="m-view-btn active">会话</button>
+    <button type="button" data-mview-btn="data" class="m-view-btn">总线</button>
+  </nav>
+
+  <!-- 顶部失败提示条（B5-3；B5-5 扩展双 kind）：任一数据端点 fetch 失败（网络错/
+       404 端点未就绪同路径，kind=net）或本轮任一数据口 401（kind=auth，鉴权失败
+       文案）时显示，不白屏不静默不弹窗；随每轮轮询重估，恢复成功自动隐藏。
+       role=alert 使读屏可感知；默认 hidden -->
+  <div id="load-error" class="load-error" role="alert" hidden></div>
+
+  <!-- ① 全局状态条（§5.2 ①）：五个占位槽位，数据由 B5-3 轮询填充；尾部 ◐ 主题
+       三态开关（b4-W1/FR8，type="button" 不占 AC14.5 唯一表单名额，逻辑在 app.js） -->
+  <header id="global-bar" class="global-bar">
+    <span class="brand">aiteam 看板</span>
+    <span class="stat">项目数 <b id="stat-projects">–</b></span>
+    <span class="stat">栏目数 <b id="stat-columns">–</b></span>
+    <span class="stat">失联会话数 <b id="stat-lost" class="lost-value">–</b></span>
+    <span class="stat">block 未回执数 <b id="stat-blocks">–</b></span>
+    <span class="stat">当前时间 <b id="stat-clock">–</b></span>
+    <button id="theme-toggle" type="button" class="theme-toggle" title="主题：跟系统">◐</button>
+  </header>
+
+  <!-- 配置展示区（只读，B5-6；b5-spec §八增补/AC23.4 联动/总控 #14②）：
+       三阈值生效值 + 时间窗概览计数，数据源=#17 响应（config 段 + windows 压缩
+       视图汇总——主轮询既有同源，零新增请求）。PRD 配置双层模型：看板只读+
+       对话定位不变，编辑类操作不做——本区零 input/button（AC14.5 唯一表单
+       红线不破），纯文本槽位由 app.js renderConfigBar 填充 -->
+  <div id="config-bar" class="config-bar">
+    <span class="config-label">运行配置（只读）</span>
+    <span class="stat">心跳失联阈值 <b id="cfg-heartbeat">–</b></span>
+    <span class="stat">哨兵失活阈值 <b id="cfg-sentinel">–</b></span>
+    <span class="stat">进度 stale 阈值 <b id="cfg-stale">–</b></span>
+    <span class="stat">时间窗 <b id="cfg-windows">–</b></span>
+  </div>
+
+  <!-- 中段：② 左栏 + 中列对话轨道 + ③ 右栏标签区（grid 三列，b4-W2 川字） -->
+  <div class="main-row">
+
+    <!-- ② 项目-栏目-会话三层树（§5.2 ②；b3-W3 三层化，平铺会话心跳面撤销）：
+         项目节点（▶ 可折叠）→栏目节点（▶ 可折叠）→会话行，由 B5-3~B5-4 轮询渲染。
+         会话行四件套：名/角色/栏目 + 状态徽标（在线心跳时长 / 失联红 .lost）+
+         哨兵在挂标记 + 未读角标（0 不渲染）。会话行点选 = 选中/再点取消选中会话
+         （dataset 三元组 project/column/name——sessions.name 跨项目可重名，三元组
+         才唯一定位，B5-4 建映射用）；本区重绘函数永不触碰 ④ 区 DOM（§5.3 对话
+         输入框焦点保护——两区渲染路径架构性隔离） -->
+    <aside id="project-tree" class="project-tree">
+      <h2 class="zone-title">项目-栏目-会话树</h2>
+      <div id="tree-body" class="tree-body"><!-- B5-3 填充三层树（b3-W3 起） --></div>
+    </aside>
+
+    <!-- 中列（b4-W2 川字）：对话+发送纵列轨道——面板填满轨道高、表单恒在轨道底
+         （AC1 发送框常驻可见）。渲染路径零影响：app.js/dialog.js 全按 id 取节点 -->
+    <section id="center-col" class="center-col">
+      <!-- ④ 对话面板（§5.2 ④ / #24 唯一写口；b4-W2 自底部 240px 条迁入中列）：
+           头部=目标会话标识+关闭按钮（关闭=取消选中+停 3s 独立轮询）；#dialog-log
+           对话流 JS 渲染；#dialog-error 面板内反馈位。全页唯一表单控件不变
+           （一个文本框+一个发送按钮，AC14.5 红线）；渲染路径只写 #dialog-log，
+           永不触碰 #dialog-input（焦点保护）。两条设计理由：.dialog-form 用 div
+           而非 form——发送经 JS，禁用原生提交避免整页刷新；from 显示名不设输入位
+           （机械闸 input=1，from 字段恒不发） -->
+      <section id="dialog-panel" class="dialog-panel">
+        <div class="dialog-head">
+          <span id="dialog-target" class="dialog-target">在左侧树点选会话开始对话</span>
+          <button id="dialog-close" type="button" hidden>关闭</button>
+        </div>
+        <div id="dialog-log" class="dialog-log">
+          <div class="empty-guide">
+            <p class="empty-guide-main">在左侧树点选会话开始对话</p>
+            <p class="empty-guide-sub">选中会话后此处展示对话流，底部输入框可直接发送消息。</p>
+          </div>
+        </div>
+        <p id="dialog-error" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-form">
+          <input id="dialog-input" type="text" placeholder="向选中会话发送消息…"
+                 autocomplete="off">
+          <button id="dialog-send" type="submit" disabled>发送</button>
+        </div>
+      </section>
+    </section>
+
+    <!-- ③ 标签区四 tab（§5.2 ③）：B5-3 接管切换交互，ARIA 三件套已补全
+         （容器 tablist / 按钮 tab+aria-selected+roving tabindex / pane
+         tabpanel+aria-labelledby，键盘左右 Home/End 切换见 app.js）。
+         所有 tab 按钮均为 type="button" 非提交类——全页提交类按钮仅 dialog-send
+         一个（AC14.5 唯一表单机械断言依据，勿改为默认 type） -->
+    <section id="tab-area" class="tab-area">
+      <nav class="tab-bar" role="tablist" aria-label="看板数据区">
+        <button type="button" class="tab-btn active" role="tab" id="tab-btn-bus"
+                data-tab="tab-bus" aria-selected="true" aria-controls="tab-bus"
+                tabindex="0">总线消息流</button>
+        <button type="button" class="tab-btn" role="tab" id="tab-btn-resources"
+                data-tab="tab-resources" aria-selected="false" aria-controls="tab-resources"
+                tabindex="-1">资源占用</button>
+        <button type="button" class="tab-btn" role="tab" id="tab-btn-windows"
+                data-tab="tab-windows" aria-selected="false" aria-controls="tab-windows"
+                tabindex="-1">时间窗</button>
+        <button type="button" class="tab-btn" role="tab" id="tab-btn-column-detail"
+                data-tab="tab-column-detail" aria-selected="false" aria-controls="tab-column-detail"
+                tabindex="-1">栏目明细</button>
+      </nav>
+
+      <!-- 总线消息流：按时间倒序+分级徽标（AC14.3），B5-3 轮询渲染 -->
+      <div id="tab-bus" class="tab-pane active" role="tabpanel" aria-labelledby="tab-btn-bus" tabindex="0">
+        <p class="placeholder">总线消息流（等待轮询数据）</p>
+      </div>
+
+      <!-- 资源占用：端口/账号段/数据段分组表（AC14.4），B5-3 轮询渲染 -->
+      <div id="tab-resources" class="tab-pane" role="tabpanel" aria-labelledby="tab-btn-resources" tabindex="0">
+        <p class="placeholder">资源占用（端口/账号段/数据段）</p>
+      </div>
+
+      <!-- 时间窗：栏目×阶段矩阵 allowed/waiting（FR3），B5-3 轮询渲染 -->
+      <div id="tab-windows" class="tab-pane" role="tabpanel" aria-labelledby="tab-btn-windows" tabindex="0">
+        <p class="placeholder">时间窗（栏目×阶段矩阵）</p>
+      </div>
+
+      <!-- 栏目明细：选中栏目的信箱待消费/哨兵活性，B5-3 依②区选中栏目渲染 -->
+      <div id="tab-column-detail" class="tab-pane" role="tabpanel" aria-labelledby="tab-btn-column-detail" tabindex="0">
+        <p class="placeholder">栏目明细（信箱待消费/哨兵活性）</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ⑤ 底栏（§5.2 ⑤）：三槽位，B5-3 填充 -->
+  <footer id="footer-status" class="footer-status">
+    <span>token 状态 <b id="footer-token">–</b></span>
+    <span>服务版本 <b id="footer-version">–</b></span>
+    <span>轮询倒计时 <b id="footer-countdown">–</b></span>
+  </footer>
+
+  <script src="/app.js" defer></script>
+  <script src="/dialog.js" defer></script>
+</body>
+</html>
