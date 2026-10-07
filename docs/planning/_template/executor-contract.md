@@ -16,6 +16,17 @@
 4. **含 Web 页面的批次：浏览器自测并修复**——GUI 黑盒点走查核心动线，修完复测；纯后端/文档批跳过本步（在 plan 执行模式行声明）。
 5. **finishing-a-development-branch**——以上全过才收尾：回主仓 rebase master → `merge --no-ff` 回 master → 删分支/worktree（**远端操作按 {{REMOTE_POLICY}}**）。
 
+### progress 上报纪律（四行）
+
+<!-- 此节写什么：开发期 progress 上报的最小纪律——与五步链同域不新开大节；
+     上报数据在看板对话面板以「过程 N 条」折叠分组展示（观测域旁路，不进消息
+     协议——不计数/不响铃/不进 pending）。 -->
+
+1. **记录时机三锚点**：每任务 TDD 转绿一条 / 审查必须修复项修完一条 / merge 回 master 一条（`--commit` 带 HEAD hash）。
+2. **summary=一句话结论式**（动词开头，不贴日志长输出）。
+3. **`--tests` 字段如实**（fail 报 fail，不许报喜）。
+4. **提交 env 前缀（自动层前提）**：提交时以身份四参 env 前缀触发 post-commit 自动上报（`AITEAM_PROJECT=<项目code> AITEAM_COLUMN=<栏目> AITEAM_SESSION=<会话名> AITEAM_ROLE=<角色> git commit ...`）——AI 会话为独立子进程形态，裸 export 不跨调用；不携带则钩子静默跳过上报（不阻塞提交）。
+
 ## 二、收尾与信号（两步落盘，缺一=断链）
 
 <!-- 此节写什么：批次做完后的固定落盘序列——状态回写（操作主仓路径）+信号发出+重挂哨兵+醒后先读信号四动作；通讯纪律全部走 aiteam CLI（send/poll/ack/status/watch），不依赖任何会话记忆。 -->

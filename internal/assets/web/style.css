@@ -543,7 +543,7 @@ b { font-weight: 600; }
 /* ---------- ④ 对话流双侧气泡（AC15：from_board=true 看板侧右 / false agent 左） ---------- */
 /* 级联补丁：log 原规则是块容器，此处改纵列 flex——子项 align-self 才能分侧 */
 .dialog-log { display: flex; flex-direction: column; }
-.msg-row { max-width: 78%; margin: 5px 0; }
+.msg-row { max-width: 100%; margin: 5px 0; } /* 宽度统一：chat 气泡与 direct CLI 行同宽（同对话双形态混排不再异宽）；inline-block 气泡仍随内容收缩 */
 .msg-row.from-board { align-self: flex-end; text-align: right; }
 .msg-row.from-agent { align-self: flex-start; }
 .msg-body {
@@ -638,8 +638,9 @@ b { font-weight: 600; }
 /* ---------- direct 合流行（AC4.3 kind 分支样式判据面） ----------
    kind=direct 走 CLI 侧样式行（非气泡）：等宽字体+左侧竖线的终端引用块观感，与
    上方既有块 chat 双侧气泡（board 右/agent 左，零回归）视觉可区分；行通栏展开
-   （.msg-row 78% 上限仅气泡行语义）。其余 kind（receipt 等理论不进流，防御兜底）
-   同构灰态 .kind-other */
+   （行宽统一 100%：chat 气泡与 CLI 行同宽，形态质感保留——2026-10-08 用户验收
+   反馈同对话双形态混排异宽，宽度统一质不变）。其余 kind（receipt 等理论不进流，
+   防御兜底）同构灰态 .kind-other */
 .msg-row.kind-direct, .msg-row.kind-other {
   align-self: stretch;
   max-width: 100%;
@@ -697,6 +698,25 @@ b { font-weight: 600; }
 .kind-direct .msg-folded::after, .kind-other .msg-folded::after {
   background: linear-gradient(var(--fade-card), var(--bg-card));
 }
+
+/* ---------- b5-W4 过程流单组折叠（progress 合流行） ----------
+   灰态族同构 kind-direct/other——只用既有 CSS 变量，亮色 :root 单源+暗色双块
+   （prefers-color-scheme 媒体查询/data-theme）自动覆盖，不新增颜色字面量
+   （b5-spec §2.2 主题红线） */
+.progress-group { margin: 4px 0; }
+.progress-head {
+  display: inline-block;
+  border: none;
+  background: none;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
+  border-left: 2px solid var(--border);
+}
+.progress-head:hover { color: var(--text-2-strong); text-decoration: underline; }
+.progress-rows { padding: 2px 0 2px 10px; }
+.progress-row { font-size: 12px; color: var(--text-3); padding: 1px 0; }
 
 /* ---------- 两态 chip（FR6 结构面，仅 from_board=true 行挂） ----------
    色板沿用既有 .win-allowed/.win-waiting 对（绿=已处理/灰=已投递）；翻拍只认当轮

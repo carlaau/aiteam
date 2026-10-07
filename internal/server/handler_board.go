@@ -146,14 +146,30 @@ func (s *Server) handleBoardSend(w http.ResponseWriter, r *http.Request) {
 // 数据面换 QuerySessionTimeline 合流后 direct 条目也进流，kind 原值直出区分流别；
 // from=发送方 sender_label 冗余显示，board 发 sender_session_id=0 无会话身份 →
 // "-"。无已读字段——AC15.3 结构判据不变（positions/kind/from 键名不含已读类
-// 子串，本批不引入已读语义；六键外多一字段即契约漂移）。
+// 子串，本批不引入已读语义）。b5-W3 契约显式解冻扩档（同 b3 扩 kind/from 先例）：
+// 消息行六键冻结面不变；kind 值域扩一档 progress，progress 行独有 progress 可选键
+// 共七键（TestBoardDialogTimelineKeys 消息行零改动+TestBoardDialogTimelineProgress
+// 双测锁定）。
 type dialogMessageRow struct {
 	Seq       int64  `json:"seq"`
 	Body      string `json:"body"`
-	FromBoard bool   `json:"from_board"` // 是否看板侧发出（sender_session_id=0，§2.2 #25；chat 专用语义，b3-W2 装配式不动）
-	Kind      string `json:"kind"`       // 消息流别原值直出（chat/direct，合流面）
+	FromBoard bool   `json:"from_board"` // 是否看板侧发出（sender_session_id=0，§2.2 #25；chat 专用语义，b3-W2 判据不动——b5-W3 装配改 if 排除 progress 行）
+	Kind      string `json:"kind"`       // 消息流别原值直出（chat/direct/progress 合流面，b5 扩 progress 档）
 	From      string `json:"from"`       // 发送方 sender_label（direct/chat agent 发）；board 发（sender_session_id=0）="-"
 	CreatedAt string `json:"created_at"`
+	// progress 行独有可选键（b5-W3）：指针+omitempty——消息行 nil 键不出现
+	// （六键冻结面零漂移）；progress 行恒非 nil 四键齐全。
+	Progress *dialogProgressDetail `json:"progress,omitempty"`
+}
+
+// dialogProgressDetail progress 行装配明细（b5-W3，spec §2.2 契约扩档）：
+// batch/task/test_status/commit_hash 四键恒在（progress 行），可空字段以 ""
+// 呈现（hook 自动层空白形态，前端「—」占位）；summary 走既有 body 键不加键。
+type dialogProgressDetail struct {
+	Batch      string `json:"batch"`
+	Task       string `json:"task"`
+	TestStatus string `json:"test_status"`
+	CommitHash string `json:"commit_hash"`
 }
 
 // boardPositions #25 顶层双维度消费位点（b3-W2 扩键）：GetPositions 原值透出——
@@ -181,6 +197,7 @@ type boardDialogData struct {
 // DB 往返（b5-spec §七，b3-W2 随扩键基线+1）：1 存在校验+1 SELECT LIMIT+1 位点读
 // （+信箱位首次惰性 upsert 冷路径，落行一次后回归 3——poll 同款随注口径）——固定
 // 2+1=3。
+// （b5-W2 复核：Timeline 内部改三路 UNION ALL 仍单条 SELECT，本端点往返账不变。）
 func (s *Server) handleBoardDialog(w http.ResponseWriter, r *http.Request) {
 	limit, ok := parseBoardLimit(w, r)
 	if !ok {
@@ -219,19 +236,36 @@ func (s *Server) handleBoardDialog(w http.ResponseWriter, r *http.Request) {
 	rows := make([]dialogMessageRow, 0, len(msgs))
 	for _, msg := range msgs {
 		// From 装配（b3-W2 冻结）：发送方 sender_label 直出；sender_session_id=0
-		// （board 发送，弱关联 0=系统/看板）无会话身份 → "-"。
+		// （board 发送，弱关联 0=系统/看板）无会话身份 → "-"。progress 行
+		// sender_session_id 恒 0（b5-W2 SQL 装配）——from="-" 自然成立零特判。
 		from := msg.SenderLabel
 		if msg.SenderSessionID == 0 {
 			from = "-"
 		}
-		rows = append(rows, dialogMessageRow{
+		row := dialogMessageRow{
 			Seq:       msg.Seq,
 			Body:      msg.Body,
-			FromBoard: msg.SenderSessionID == 0,
 			Kind:      msg.Kind,
 			From:      from,
 			CreatedAt: msg.CreatedAt,
-		})
+		}
+		// from_board 装配：board 发=sender_session_id=0（b3-W2 冻结式），
+		// progress 行显式排除恒 false——progress 非「看板侧发出」（b5-W2 SQL
+		// sender_session_id 恒 0，裸式会误判 true），两态 chip 判据（按
+		// from_board）对 progress 行天然不挂；chat/direct 行为逐字不变。
+		if msg.SenderSessionID == 0 && msg.Kind != store.MessageKindProgress {
+			row.FromBoard = true
+		}
+		// b5-W3：progress 行装配独有可选键（消息行 nil——omitempty 下键不出现）。
+		if msg.Kind == store.MessageKindProgress {
+			row.Progress = &dialogProgressDetail{
+				Batch:      msg.ProgressBatch,
+				Task:       msg.ProgressTask,
+				TestStatus: msg.ProgressTestStatus,
+				CommitHash: msg.ProgressCommitHash,
+			}
+		}
+		rows = append(rows, row)
 	}
 	types.WriteData(w, http.StatusOK, boardDialogData{
 		Messages:  rows,

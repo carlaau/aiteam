@@ -766,6 +766,69 @@ func TestUnreceipted(t *testing.T) {
 	}
 }
 
+// ===== TestUnreceiptedProjectScope：单栏目模式 block 未回执过滤域=项目非栏目（b2 #17）=====
+
+// TestUnreceiptedProjectScope b2-W1：block 未回执清单单栏目模式按调用方项目过滤
+// ——过滤域=项目非栏目（同项目跨栏目欠账保留），零值 opts 全量不变（--global
+// overview 口径零变化）。跨项目三 block 夹具：proj-a/05 + proj-a/06 + proj-b/05。
+func TestUnreceiptedProjectScope(t *testing.T) {
+	s := openTemp(t)
+	now := tsOffset(0)
+
+	projA := fixtureProject(t, s, "proj-a", "项目A", "active", 900)
+	projB := fixtureProject(t, s, "proj-b", "项目B", "active", 900)
+	colA05 := fixtureColumn(t, s, projA, "05", "栏目05", "active")
+	colA06 := fixtureColumn(t, s, projA, "06", "栏目06", "active")
+	colB05 := fixtureColumn(t, s, projB, "05", "栏目05", "active")
+
+	// 三条未回执 block（target/sender session 传 0=弱关联合法，schema.sql :63/:64
+	// 「0=无对应行不设 FK」；清单装配只消费 sender_label 与项目/栏目 code）。
+	bA05 := fixtureMessage(t, s, projA, colA05, "direct", "executor", 0, 0, "controller-A@05", "block", "halt-a05", tsOffset(-100))
+	bA06 := fixtureMessage(t, s, projA, colA06, "direct", "executor", 0, 0, "controller-A@06", "block", "halt-a06", tsOffset(-90))
+	bB05 := fixtureMessage(t, s, projB, colB05, "direct", "executor", 0, 0, "controller-B@05", "block", "halt-b05", tsOffset(-80))
+
+	// 单栏目模式锚定 proj-a/05：恰 2 条且全部 proj-a——含 06 跨栏目条目（锁
+	// 「过滤域=项目非栏目」语义），零 proj-b（串台禁入）。
+	ovScope, err := s.BuildOverview(now, OverviewOpts{
+		Column: &ColumnScope{ProjectCode: "proj-a", ColumnCode: "05"},
+	})
+	if err != nil {
+		t.Fatalf("单栏目 BuildOverview 失败: %v", err)
+	}
+	if len(ovScope.BlockUnreceipted) != 2 {
+		t.Fatalf("单栏目 block_unreceipted 数 = %d，期望 2（proj-a 全项目欠账）: %+v",
+			len(ovScope.BlockUnreceipted), ovScope.BlockUnreceipted)
+	}
+	gotSeqs := map[int64]bool{}
+	for _, b := range ovScope.BlockUnreceipted {
+		if strings.HasPrefix(b.Target, "proj-b") {
+			t.Errorf("单栏目清单串台 proj-b 条目：%+v", b)
+		}
+		if !strings.HasPrefix(b.Target, "proj-a/") {
+			t.Errorf("单栏目清单混入非 proj-a 条目：%+v", b)
+		}
+		gotSeqs[b.Seq] = true
+	}
+	if !gotSeqs[bA05] || !gotSeqs[bA06] {
+		t.Errorf("单栏目清单条目集 = %v，期望恰含 a05=%d 与 a06=%d（跨栏目保留）",
+			gotSeqs, bA05, bA06)
+	}
+
+	// 零值 opts=全局口径：3 条全量不变（--global 保留全量）。
+	ovAll, err := s.BuildOverview(now, OverviewOpts{})
+	if err != nil {
+		t.Fatalf("全局 BuildOverview 失败: %v", err)
+	}
+	if len(ovAll.BlockUnreceipted) != 3 {
+		t.Fatalf("全局 block_unreceipted 数 = %d，期望 3: %+v",
+			len(ovAll.BlockUnreceipted), ovAll.BlockUnreceipted)
+	}
+	seqs := []int64{ovAll.BlockUnreceipted[0].Seq, ovAll.BlockUnreceipted[1].Seq, ovAll.BlockUnreceipted[2].Seq}
+	if !slices.Equal(seqs, []int64{bB05, bA06, bA05}) {
+		t.Errorf("全局清单 seq = %v，期望 DESC %v", seqs, []int64{bB05, bA06, bA05})
+	}
+}
+
 // ===== TestResourcesSummary：空表={in_use_count:0, by_type:{}}（空 map 非 null）/ 有行计数 =====
 
 func TestResourcesSummary(t *testing.T) {

@@ -265,8 +265,8 @@ func renderGlobalLines(ov *statusData) []string {
 // renderColumnLines 单栏目模式逐行渲染（AC11.1 四项：待消费数/最新摘要/哨兵
 // 活性/时间窗状态 + block 未回执段）：行形态与全局同源（两空格分隔），信箱行
 // 增 latest 列（全局样例无此列）；sessions/resources 段不在四项范围不渲染。
-// block 清单走端点全局口径原样透出（store 冻结「全局聚合口径无 :me 维度」，
-// CLI 纯消费不做二次过滤）。
+// block 清单走端点单栏目口径原样透出（store 侧已按调用方项目过滤——过滤域=
+// 项目非栏目；CLI 纯消费不做二次过滤）。
 func renderColumnLines(ov *statusData, project, column string) []string {
 	lines := []string{"aiteam status " + ov.GeneratedAt}
 	for _, p := range ov.Projects {

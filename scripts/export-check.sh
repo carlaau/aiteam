@@ -40,6 +40,7 @@ REQUIRED_PATHS=(
   "LICENSE"                           # MIT 协议文本，开源发布法定件
   "README.md"                         # 项目门面说明
   "AGENTS.md"                         # AI/人接手动线（第一读序+通讯接入区块）
+  "CONTRIBUTING.md"                   # 贡献者门面（开源贡献动线）
   ".gitattributes"                    # 行尾/eol 策略（全仓 LF 口径载体）
   ".gitignore"                        # 构建产物/本地配置忽略策略
   "go.mod"                            # Go 模块定义（单二进制构建入口依赖）

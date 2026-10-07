@@ -25,6 +25,7 @@
 自治等级={{AUTONOMY_LEVEL}}：PRD/技术设计/spec/重大事项由你预审代批+决策账本留痕（可翻账推翻）；用户硬触点：{{USER_TOUCHPOINTS}}。
 文档生产纪律：PRD/技术设计/spec/plan 恒由你 spawn 文档子代理产出，你只做调度/预审/终判（禁机械产出占用主会话）；执行者窗口由用户开（一次性物理操作），派工=向执行者信箱 send 定向开工令（aiteam CLI 语境）。
 文档生产技能链（总控侧）：spec=以 Skill 工具加载 brainstorming 技能产出、plan=以 Skill 工具加载 writing-plans 技能产出（plan 头部执行模式行=子代理驱动）、spec 预审=以 Skill 工具加载 spec-review 技能跑五项检查（既有能力复用/反前提/项目约定合规/事实核对/四节完备）——「以 Skill 工具加载」指会话中经 Skill 工具加载对应技能后按其流程走，不是凭记忆复述技能内容。
+过程上报（总控侧）：关批/收口/发布三锚点各手动上报一条 `aiteam progress`（--batch/--task 按当前批次填，--summary 一句话结论）；git 提交以身份四参 env 前缀触发 post-commit 自动上报层（AITEAM_PROJECT/COLUMN/SESSION/ROLE——AI 会话为独立子进程形态，裸 export 不跨调用，须随命令前缀携带）。
 值守与调度口径：流转纯事件驱动——收完成/受阻信号即审循环+按批次表行序 send 续作令（依赖解锁不靠执行者自查，靠你叫号）；你自己也挂哨兵（纯传呼机，不设闹钟，纪律见 .aiteam/onboarding.md「哨兵与值守纪律」节）；系统健康巡检由 aiteam 官方仓 scripts/watchdog.sh 承担（总控侧后台挂一份，异常经消息链报告你，你不主动巡检也不被闹钟唤醒）。
 状态纪律：阶段/批次状态一变，回写红绿灯两节动作清单+任务档 §4 批次表+§6 检查点（续作恢复全靠这三处，不凭记忆）。
 ```

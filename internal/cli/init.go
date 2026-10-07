@@ -216,11 +216,12 @@ var placeholderRe = regexp.MustCompile(`\{\{[A-Za-z0-9_]+\}\}`)
 // _template 整目录播种计数（b10：报告按模板件组汇总一行，不逐件刷屏；头部统计
 // 口径含模板件——生成/跳过数均计入）。
 type initReport struct {
-	created    []string
-	updated    []string
-	skipped    []string
-	tplCreated int // _template 播种新增件数
-	tplSkipped int // _template 播种已存在跳过件数
+	created        []string
+	updated        []string
+	skipped        []string
+	tplCreated     int // _template 播种新增件数
+	tplSkipped     int // _template 播种已存在跳过件数
+	hookEnvSkipped int // hook 环境性跳过——非 git 仓根/auto_hook=off，非「已存在产物」，不计入升级提示 N
 }
 
 // RunInit 是 `aiteam init --project <code> --name <名称> [--skills] [--vcs git|svn]`
@@ -711,6 +712,7 @@ func installHook(dir string, rep *initReport) error {
 	display := ".git/hooks/post-commit"
 	if fi, err := os.Stat(filepath.Join(dir, ".git")); err != nil || !fi.IsDir() {
 		rep.skipped = append(rep.skipped, display+"（非 git 仓根，未安装）")
+		rep.hookEnvSkipped++ // b3：环境性跳过，不计入升级提示 N（摘要「跳过 N」口径零回归）
 		return nil
 	}
 	cfgPath := ""
@@ -723,6 +725,7 @@ func installHook(dir string, rep *initReport) error {
 	}
 	if !cfg.Progress.AutoHook {
 		rep.skipped = append(rep.skipped, display+"（progress.auto_hook=off）")
+		rep.hookEnvSkipped++ // b3：环境性跳过，不计入升级提示 N
 		return nil
 	}
 	path := filepath.Join(dir, ".git", "hooks", "post-commit")
@@ -769,6 +772,13 @@ func writeIfAbsent(path, display string, data []byte, rep *initReport) error {
 func writeReport(w io.Writer, rep *initReport, skillsInstalled bool, skillsNew, skillsKept int, commOnly bool) {
 	fmt.Fprintf(w, "aiteam init 完成：生成 %d，更新 %d，跳过 %d\n",
 		len(rep.created)+rep.tplCreated, len(rep.updated), len(rep.skipped)+rep.tplSkipped)
+	// b3 升级提示：跳过件存在时贴着摘要行（误读点）输出一行升级指引（哑计数→显式
+	// 指引）。N 口径=实况件存在性跳过（排除 hook 环境性跳过）+模板件跳过+技能包
+	// 保留；hook 环境跳过仍照旧计入摘要「跳过 N」，只有本行排除。位置硬约束：
+	// writeReport 内、摘要行后第一行、comm-only 提前 return 之前（spec §7 裁量点 3）。
+	if hintN := len(rep.skipped) - rep.hookEnvSkipped + rep.tplSkipped + skillsKept; hintN > 0 {
+		fmt.Fprintf(w, "升级提示: 本次跳过已存在产物 %d 件（幂等保护不覆盖）——要更新某件=手动删除该文件后重跑 init\n", hintN)
+	}
 	if n := len(rep.created) + len(rep.updated) + len(rep.skipped); n > 0 {
 		fmt.Fprintln(w, "实况件:")
 		for _, s := range rep.created {

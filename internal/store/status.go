@@ -340,8 +340,9 @@ func (s *Store) BuildOverview(now string, opts OverviewOpts) (Overview, error) {
 	applySentinels(boxes, sessionByID, sentinels, columnByID, projects)
 	finalizeMailboxes(boxes, columnByID, projectIdx, projects)
 
-	// 往返 8：block 未回执清单（§3.6 NOT EXISTS 冻结 SQL 全局口径——聚合无 :me 维度）。
-	unreceipted, err := s.queryUnreceiptedBlocks()
+	// 往返 8：block 未回执清单（§3.6 NOT EXISTS 冻结 SQL；单栏目模式按调用方项目
+	// 过滤——过滤域=项目非栏目，overview 全量口径不变）。
+	unreceipted, err := s.queryUnreceiptedBlocks(scopeProjectCode(opts.Column))
 	if err != nil {
 		return Overview{}, err
 	}
@@ -825,29 +826,41 @@ JOIN columns c ON c.id = s.column_id`
 }
 
 // queryUnreceiptedBlocks 往返 8：发送方 block 未回执清单（§3.6 冻结 SQL：
-// level='block' AND NOT EXISTS(回执) ORDER BY seq DESC；全局聚合口径无 :me 维度）。
-// 多带出项目/栏目 code 两条装配列（§2.3 target="proj/col/role" 结构所需）。
+// level='block' AND NOT EXISTS(回执) ORDER BY seq DESC）。projectCode 非空=单栏目
+// 模式按调用方项目过滤（AND pr.code = ? 动态拼接，querySessions conds 同款先例
+// ——过滤域=项目非栏目：同项目跨栏目欠账保留）；空串=SQL 文本逐字不变（--global
+// overview 全量口径零变化）。多带出项目/栏目 code 两条装配列（§2.3
+// target="proj/col/role" 结构所需）。
 //
 // B3-8 收敛裁定（b3-spec §六）：保留自含实现，不收敛为 B2 ListUnreceipted——
 //   - 口径不匹配：ListUnreceipted(senderSessionID) 按 :me 发送方过滤（「我」发出
-//     的 block），本清单是全局全发送方口径（看板「阻断未回执」问的是全场谁被
-//     阻断——技术设计 §4.2 --global 样例两发送方行 #881<-controller-A@05 与
-//     #884<-controller-A@06、V3 四问③全场视角）——传任一具体 sender 都截断
-//     清单，无法经既有签名复用。
+//     的 block），本清单是全发送方口径（项目维度随调用方模式收口：单栏目按调用
+//     方项目过滤、overview 全量；发送方维度不受模式影响——看板「阻断未回执」
+//     问的是全场谁被阻断——技术设计 §4.2 --global 样例两发送方行 #881<-
+//     controller-A@05 与 #884<-controller-A@06、V3 四问③全场视角）——传任一
+//     具体 sender 都截断清单，无法经既有签名复用。
 //   - select 面不匹配：status 需 JOIN projects/columns 带出 proj/col code 装配
 //     target 三段式，ListUnreceipted 无此两列。
 //   - 谓词同源：`level='block' AND NOT EXISTS(SELECT 1 FROM message_receipts …)
 //     ORDER BY seq DESC` 与 §3.6/B2 receipts.go 逐字一致，双路径显式登记非静默。
-func (s *Store) queryUnreceiptedBlocks() ([]BlockUnreceipted, error) {
-	rows, err := s.DB.Query(`
+func (s *Store) queryUnreceiptedBlocks(projectCode string) ([]BlockUnreceipted, error) {
+	q := `
 SELECT m.seq, m.sender_label, m.target_role, m.created_at,
        pr.code, c.code
 FROM messages m
 JOIN projects pr ON pr.id = m.project_id
 JOIN columns c ON c.id = m.column_id
 WHERE m.level = 'block'
-  AND NOT EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_seq = m.seq)
-ORDER BY m.seq DESC`)
+  AND NOT EXISTS (SELECT 1 FROM message_receipts r WHERE r.message_seq = m.seq)`
+	var args []any
+	if projectCode != "" { // 空串不追加——SQL 文本与冻结版逐字一致（全局口径零变化）
+		q += `
+  AND pr.code = ?`
+		args = append(args, projectCode)
+	}
+	q += `
+ORDER BY m.seq DESC`
+	rows, err := s.DB.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: status 未回执查询失败: %w", err)
 	}

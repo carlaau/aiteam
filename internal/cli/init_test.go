@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1598,5 +1599,115 @@ func TestInitUpgradeSeedsIncremental(t *testing.T) {
 			continue
 		}
 		t.Errorf("升级重跑产生了预期外新文件 %s（新增面应恰为被删新件的重新播种）", rel)
+	}
+}
+
+// ---------- b3 init 升级提示（TDD 红先行）：触发口径+N 计数+幂等三重全等 ----------
+
+// snapshotMtimes 递归快照 dir 下全部常规文件的 mtime（相对路径→UnixNano），与
+// snapshotTree 配合构成「文件集合+内容 sha256+mtime」三重幂等比对（b3 AC3：
+// 重跑零触碰——无任何文件被改写，连 mtime 都不变；Windows mtime 粒度非风险，
+// 重跑零写盘无粒度竞争，spec §7.4）。
+func snapshotMtimes(t *testing.T, dir string) map[string]int64 {
+	t.Helper()
+	snap := map[string]int64{}
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		snap[rel] = info.ModTime().UnixNano()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mtime 快照 %s 失败: %v", dir, err)
+	}
+	return snap
+}
+
+// TestInitUpgradeHint b3 升级提示三场景（spec §4 W1）：
+// ①旧盘重跑必现提示行——逐字锚+regexp 恰一行且 N≥1；
+// ②全新非 git 目录零提示，且摘要仍「跳过 1」（hook 环境跳过计数语义不回归——
+//
+//	本断言是 hookEnvSkipped 排除口径的杀手锏：无排除的朴素 N 实现在此爆红）；
+//
+// ③场景①的幂等面——重跑前后文件集合+内容 sha256+mtime 三重全等。
+func TestInitUpgradeHint(t *testing.T) {
+	// 场景①+③：临时目录首跑 full init 铺旧产物 → 双快照 → 重跑 → 断言提示与幂等
+	dir := t.TempDir()
+	runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目")
+	beforeTree := snapshotTree(t, dir)
+	beforeMtimes := snapshotMtimes(t, dir)
+
+	out2 := runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目")
+	afterTree := snapshotTree(t, dir)
+	afterMtimes := snapshotMtimes(t, dir)
+
+	// 场景①：恰一行提示——逐字锚「升级提示: 本次跳过已存在产物 」+regexp
+	//「N 件（幂等保护不覆盖）——要更新某件=手动删除该文件后重跑 init」且 N≥1
+	re := regexp.MustCompile(`升级提示: 本次跳过已存在产物 (\d+) 件（幂等保护不覆盖）——要更新某件=手动删除该文件后重跑 init`)
+	hits := 0
+	for _, line := range strings.Split(out2, "\n") {
+		if m := re.FindStringSubmatch(line); m != nil {
+			hits++
+			if n, err := strconv.Atoi(m[1]); err != nil || n < 1 {
+				t.Errorf("升级提示 N 须≥1，got %q:\n%s", m[1], out2)
+			}
+		}
+	}
+	if hits != 1 {
+		t.Errorf("旧盘重跑恰一行升级提示，got %d 行:\n%s", hits, out2)
+	}
+
+	// 场景③：重跑三重全等（文件集合+内容 sha256+mtime，幂等红线）
+	if len(beforeTree) != len(afterTree) {
+		t.Fatalf("重跑文件数变化: before=%d after=%d", len(beforeTree), len(afterTree))
+	}
+	for rel, sum := range beforeTree {
+		if afterTree[rel] != sum {
+			t.Errorf("重跑改写了 %s 内容（幂等红线）", rel)
+		}
+		if beforeMtimes[rel] != afterMtimes[rel] {
+			t.Errorf("重跑触碰了 %s mtime（幂等红线）", rel)
+		}
+	}
+
+	// 场景②：全新非 git 临时目录——零「升级提示」字样；摘要仍「跳过 1」
+	//（hook「非 git 仓根」环境跳过照旧计入摘要统计，展示面零回归）
+	fresh := t.TempDir()
+	outFresh := runInitForTest(t, fresh, "--project", "proj-a", "--name", "示例项目")
+	if strings.Contains(outFresh, "升级提示") {
+		t.Errorf("全新目录不应出现升级提示:\n%s", outFresh)
+	}
+	if !strings.Contains(outFresh, "跳过 1") {
+		t.Errorf("全新非 git 目录摘要应仍为「跳过 1」（hook 环境跳过展示面零回归）:\n%s", outFresh)
+	}
+}
+
+// TestInitUpgradeHintCommOnlyN4 b3 AC4：N 口径机械对拍——comm-only 重跑钉死 N=4。
+// 实况件跳过恰 onboarding/cli.json/AGENTS/CLAUDE 四件；comm-only 不装 hook（无
+// hook 跳过项入账）；模板件/技能包两项 comm-only 恒零——N 恰=4 可逐字对拍。
+// 防回归钉子：未来 hookEnvSkipped 排除口径被拆或 N 公式漂移时本测爆红。
+func TestInitUpgradeHintCommOnlyN4(t *testing.T) {
+	dir := t.TempDir()
+	runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目", "--comm-only")
+	out2 := runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目", "--comm-only")
+
+	want := "升级提示: 本次跳过已存在产物 4 件（幂等保护不覆盖）——要更新某件=手动删除该文件后重跑 init"
+	if !strings.Contains(out2, want) {
+		t.Errorf("comm-only 重跑升级提示应恰 N=4:\n%s", out2)
+	}
+	if !strings.Contains(out2, "跳过 4") {
+		t.Errorf("comm-only 重跑摘要应「跳过 4」（展示面口径零回归）:\n%s", out2)
 	}
 }

@@ -69,6 +69,10 @@ let lastDialogJson = '';
 // 重绘（消息/位点变化触发）按集合恢复展开态；每轮渲染按当前 limit 窗口裁剪，
 // 防长期驻留无界增长
 const dialogUnfoldedSeqs = new Set();
+// progress 分组展开态（b5-W4）：单组形态模块级单布尔即可（无需按键记忆，
+// dialogUnfoldedSeqs 同族跨重绘记忆思路）——true=展开，默认折叠；3s 轮询重绘
+// （JSON diff 触发）按本值恢复展开态，组头点击翻转后组块内局部重渲染
+let progressGroupUnfolded = false;
 // #24 发送单飞闸（防连点重复投递）
 let sendingMessage = false;
 
@@ -218,6 +222,8 @@ function pruneSeqSet(set, liveSeqs) {
 // JSON diff 键=messages+positions 合串（未变不重绘）；展开/收合态按 seq 记忆跨重绘
 // 保持；全 textContent 无 innerHTML；只写 #dialog-log（焦点保护）；贴底时新消息
 // 自动跟随滚动
+// progress 分流（b5-W4）——kind='progress' 行归「过程 N 条」单组折叠块（默认
+// 折叠，组头点击展开，展开态跨重绘记忆），组块锚在组内最新 progress 行合流位；
 function renderDialog(messages, positions) {
   const log = $('dialog-log');
   if (!log) return;
@@ -235,10 +241,66 @@ function renderDialog(messages, positions) {
   const ordered = messages.slice().reverse(); // 服务端 seq DESC → 对话正序（旧→新）
   // 对话位（chip 翻拍依据）：缺位/非法防御回 null——chip 恒「已投递」不误翻
   const dialogPos = positions && typeof positions.dialog === 'number' ? positions.dialog : null;
-  for (const m of ordered) {
+  // progress 分流（b5-W4）：kind='progress' 行归单组折叠块，组块锚在组内最新
+  // 一条 progress 行的时间线合流位（正序遍历最后一条 progress 处插入——比它新
+  // 的消息仍在组块下方，消息与过程相对时序保真；§7.4 裁量点 4 后备=末尾锚，
+  // 执行者可裁报备），其余 progress 行不单独占位。消息行机制零动：chip 按
+  // from_board 判据独立于 kind 分支（progress 行恒 false 天然不挂）、超长折叠
+  // 按 seq 记忆（progress 行 seq=0 不入 dialogUnfoldedSeqs，pruneSeqSet 集合中
+  // 的 0 为无害成员）。
+  const progressRows = ordered.filter((m) => m.kind === 'progress');
+  const lastProgressIdx = ordered.map((m) => m.kind).lastIndexOf('progress');
+  for (let i = 0; i < ordered.length; i++) {
+    const m = ordered[i];
+    if (m.kind === 'progress') {
+      if (i === lastProgressIdx) log.append(buildProgressGroup(progressRows));
+      continue;
+    }
     log.append(buildMessageRow(m, dialogPos));
   }
   if (nearBottom) log.scrollTop = log.scrollHeight;
+}
+
+// progress 单组折叠块（b5-W4，spec §2.2）：组头「过程 N 条」（N=窗口内 progress
+// 行数）默认折叠，点击展开=逐行渲染、再点收起；展开态=progressGroupUnfolded
+// 模块级单布尔跨重绘记忆。全 textContent 无 innerHTML；样式只用既有 CSS 变量
+// （.progress-group 灰态族，kind-direct/other 同构，亮暗双主题自动覆盖）。
+function buildProgressGroup(rows) {
+  const group = el('div', 'progress-group');
+  const head = el('button', 'progress-head');
+  head.type = 'button';
+  const bodyBox = el('div', 'progress-rows');
+  const apply = () => {
+    // 组头文案（§7.5 裁量点 5：语义要件=N 数齐全，▸/▾ 状态标记可调，报备即可）
+    head.textContent = (progressGroupUnfolded ? '▾ ' : '▸ ') + '过程 ' + rows.length + ' 条';
+    bodyBox.textContent = '';
+    bodyBox.hidden = !progressGroupUnfolded;
+    if (progressGroupUnfolded) {
+      for (const p of rows) bodyBox.append(buildProgressRow(p));
+    }
+  };
+  head.addEventListener('click', () => {
+    progressGroupUnfolded = !progressGroupUnfolded;
+    apply(); // 组块内局部重渲染——lastDialogJson 未变，不触发全 log 重绘
+  });
+  apply();
+  group.append(head, bodyBox);
+  return group;
+}
+
+// progress 展开行装配：时间 · batch/task（hook 自动层空白「—」占位不空段）·
+// ✓/✗（test_status：pass=✓/fail=✗/其余=—）· summary 一句话 · commit 短码
+// （commit_hash 非空且 >7 截前 7 位，短值原样，空省略该段）。
+function buildProgressRow(p) {
+  const d = p.progress || {};
+  const mark = d.test_status === 'pass' ? '✓' : (d.test_status === 'fail' ? '✗' : '—');
+  const hash = txt(d.commit_hash);
+  const segs = [fmtTime(p.created_at), (txt(d.batch) || '—') + '/' + (txt(d.task) || '—'),
+    mark, txt(p.body)];
+  if (hash) segs.push(hash.length > 7 ? hash.slice(0, 7) : hash);
+  const row = el('div', 'progress-row');
+  row.textContent = segs.join(' · ');
+  return row;
 }
 
 // 单条消息行装配（b3-W4）：kind 分支选行形态 + 常驻 meta 行 + 超长折叠 + 两态 chip。

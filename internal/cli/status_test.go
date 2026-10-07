@@ -356,8 +356,8 @@ func TestColumnMode(t *testing.T) {
 		return runStatus(ctx, regIdentityArgs(), addr)
 	})
 	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
-	if len(lines) != 7 {
-		t.Fatalf("单栏目输出行数 = %d，期望 7（首行+2 信箱行+block 标题+3 清单）：\n%s", len(lines), stdout)
+	if len(lines) != 5 {
+		t.Fatalf("单栏目输出行数 = %d，期望 5（首行+2 信箱行+block 标题+1 清单）：\n%s", len(lines), stdout)
 	}
 
 	assertStatusTokens(t, "首行", lines[0], "aiteam status "+statusNow)
@@ -371,17 +371,20 @@ func TestColumnMode(t *testing.T) {
 	assertStatusTokens(t, "executor 四项行", lines[2],
 		"management c01 executor pending=1 pos=0 latest=#"+strconv.FormatInt(blockSeq, 10)+
 			" block 2026-10-02T12:40:00Z sentinel=none S3:ALLOWED(09:00-18:00)")
-	// block 段走端点全局清单（store 冻结口径无 :me 维度——单栏目模式原样透出，
-	// seq DESC：本域 block 最先）。
-	assertStatusTokens(t, "block 标题行", lines[3], "block 未回执: 3 条")
+	// block 段按身份项目过滤（b2：store 谓词按调用方项目收口——仅本域欠账在列，
+	// seedStatusFixtures 的 proj-a 两条外域欠账不再混入，mode=column 语义面变化）。
+	assertStatusTokens(t, "block 标题行", lines[3], "block 未回执: 1 条")
 	assertStatusTokens(t, "block 清单本域行", lines[4],
 		"#"+strconv.FormatInt(blockSeq, 10)+" management/c01/executor <- boss@c01 (2026-10-02T12:40:00Z)")
 
-	// 不串台（信箱行区段逐行前缀判——block 全局清单合法含外域 target，不作
-	// 此断言面）：信箱行不得出现其他项目/栏目；sessions/resources 段不渲染。
-	for _, line := range lines[1:3] {
-		if strings.HasPrefix(line, "proj-a") || strings.HasPrefix(line, "proj-b") {
-			t.Errorf("单栏目信箱行串台外域：%q", line)
+	// 不串台（b2 后全输出逐行 Contains 判——block 清单行带两空格缩进，
+	// HasPrefix 只探行首探不到缩进泄漏行，Contains 含项目码+`/` 分隔即可探到；
+	// 带 `/` 后缀防误伤本域 management 夹具行——block 清单本域行为
+	// management/c01/executor 形态，不含 proj-a/、proj-b/；外域欠账禁入清单行）：
+	// 任何行不得含其他项目码；sessions/resources 段不渲染。
+	for _, line := range lines {
+		if strings.Contains(line, "proj-a/") || strings.Contains(line, "proj-b/") {
+			t.Errorf("单栏目输出串台外域：%q", line)
 		}
 	}
 	for _, banned := range []string{"sessions:", "resources in_use"} {

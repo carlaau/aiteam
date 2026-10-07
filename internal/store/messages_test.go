@@ -807,3 +807,172 @@ func TestQuerySessionTimeline(t *testing.T) {
 		t.Errorf("缺省 100 条应=最新 100 条（seq 120..21），实际首=%d 末=%d", got[0].Seq, got[99].Seq)
 	}
 }
+
+// ---- TestQuerySessionTimelineProgress：progress 第三路合流（b5-W1）----
+
+// timelineKinds 提取时间线行的 kind:body 键列表（b5 合流断言辅助：progress 行
+// Seq 恒 0——多条 progress 同为 0，seq 列表对拍在合流面失效，改用 kind:body
+// 唯一化对拍；夹具 body 全互异保证键唯一）。
+func timelineKinds(msgs []Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Kind+":"+m.Body)
+	}
+	return out
+}
+
+// TestQuerySessionTimelineProgress b5-W1：QuerySessionTimeline 第三路 progress
+// 合流——created_at 归一 DESC（消息行与 progress 行同窗混排不按表分块）；
+// progress 行装配面（Kind='progress'/Body=summary/Seq 恒 0/Progress* 四字段）；
+// 会话隔离（他会话 progress 不入流）；LIMIT=合流后总行数裁剪（progress 行与
+// 消息行同权计入窗口）；无 progress 会话时间线纯消息 seq 序（AC2 对偶面）。
+func TestQuerySessionTimelineProgress(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-10-02T08:00:00Z"
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, t0)
+	c1 := seedColumn(t, s, pid, "01", "栏目01", ColumnStatusActive, t0)
+	s1 := seedSession(t, s, pid, c1, "executor-A", "executor", t0, t0)
+	s2 := seedSession(t, s, pid, c1, "executor-B", "executor", t0, t0)
+	s3 := seedSession(t, s, pid, c1, "executor-C", "executor", t0, t0)
+
+	// 编排（created_at 旧→新互异，归一序断言面）：p1(08:00) < m1(08:01) <
+	// p2(08:02) < m2(08:03)。p1=手动层形态（batch/task 齐全、无 hash）、
+	// p2=hook 自动层形态（batch/task 空白、带 13 位 hash+branch）；
+	// p3=他会话进度（s2——会话隔离排除面）。
+	p1 := seedProgress(t, s, s1, "b5", "b5-1", "", "", TestStatusPass, "TDD 转绿", "2026-10-02T08:00:00Z")
+	m1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindChat, TargetSessionID: s1, SenderSessionID: 0, SenderLabel: "board-user:张三", Level: "normal", Body: "board->s1"}, "2026-10-02T08:01:00Z")
+	p2 := seedProgress(t, s, s1, "", "", "abc1234def5678", "feat/b5-1", TestStatusFail, "hook 自动上报", "2026-10-02T08:02:00Z")
+	m2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindChat, TargetSessionID: s1, SenderSessionID: s1, SenderLabel: "executor-A@01", Level: "normal", Body: "s1-reply"}, "2026-10-02T08:03:00Z")
+	p3 := seedProgress(t, s, s2, "b5", "b5-2", "", "", TestStatusPass, "他会话进度", "2026-10-02T08:02:00Z")
+	_ = p3 // 仅作隔离排除面夹具
+
+	// s1 时间线：created_at 归一 DESC（最新在前）——m2 > p2 > m1 > p1，
+	// progress 行按 created_at 与消息行穿插，不按表分块追加。
+	got, err := s.QuerySessionTimeline(s1, c1, "executor", 0)
+	if err != nil {
+		t.Fatalf("QuerySessionTimeline(s1) 失败: %v", err)
+	}
+	if want := []string{
+		"chat:s1-reply",
+		"progress:hook 自动上报",
+		"chat:board->s1",
+		"progress:TDD 转绿",
+	}; !slices.Equal(timelineKinds(got), want) {
+		t.Errorf("s1 时间线 = %v，期望 %v（created_at 归一 DESC 三路合流）", timelineKinds(got), want)
+	}
+
+	// progress 行装配面：Seq 恒 0（硬边界——不占 messages seq 空间）/Body=summary/
+	// 四字段逐值（got[1]=p2 自动层、got[3]=p1 手动层——序见上 want 表）。
+	if got[1].Kind != "progress" || got[1].Seq != 0 {
+		t.Errorf("got[1] 应为 progress 且 Seq=0，实际 kind=%s seq=%d", got[1].Kind, got[1].Seq)
+	}
+	if got[1].Body != "hook 自动上报" {
+		t.Errorf("progress Body = %q，期望 summary 原值", got[1].Body)
+	}
+	if got[1].ProgressBatch != "" || got[1].ProgressTask != "" {
+		t.Errorf("自动层 batch/task = %q/%q，期望空串（hook 层空白形态）", got[1].ProgressBatch, got[1].ProgressTask)
+	}
+	if got[1].ProgressTestStatus != string(TestStatusFail) || got[1].ProgressCommitHash != "abc1234def5678" {
+		t.Errorf("自动层 test_status/commit_hash = %q/%q，期望 fail/abc1234def5678", got[1].ProgressTestStatus, got[1].ProgressCommitHash)
+	}
+	if got[3].Kind != "progress" || got[3].Seq != 0 {
+		t.Errorf("got[3] 应为 progress 且 Seq=0，实际 kind=%s seq=%d", got[3].Kind, got[3].Seq)
+	}
+	if got[3].ProgressBatch != "b5" || got[3].ProgressTask != "b5-1" {
+		t.Errorf("手动层 batch/task = %q/%q，期望 b5/b5-1", got[3].ProgressBatch, got[3].ProgressTask)
+	}
+	if got[3].ProgressTestStatus != string(TestStatusPass) || got[3].ProgressCommitHash != "" {
+		t.Errorf("手动层 test_status/commit_hash = %q/%q，期望 pass/空", got[3].ProgressTestStatus, got[3].ProgressCommitHash)
+	}
+
+	// 会话隔离对偶面：s2 时间线只见自己的 progress（s1 的 p1/p2 与消息全不入）。
+	got, err = s.QuerySessionTimeline(s2, c1, "executor", 0)
+	if err != nil {
+		t.Fatalf("QuerySessionTimeline(s2) 失败: %v", err)
+	}
+	if want := []string{"progress:他会话进度"}; !slices.Equal(timelineKinds(got), want) {
+		t.Errorf("s2 时间线 = %v，期望 %v（会话隔离——他会话 progress 不入流）", timelineKinds(got), want)
+	}
+
+	// 无 progress 会话（AC2 对偶面）：s3 时间线空命中返回非 nil 空切片。
+	got, err = s.QuerySessionTimeline(s3, c1, "executor", 0)
+	if err != nil {
+		t.Fatalf("QuerySessionTimeline(s3) 失败: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("无 progress 无消息会话应返回非 nil 空切片，实际 %v", got)
+	}
+
+	// LIMIT=合流后总行数裁剪（progress 行与消息行同权计入窗口，spec §2.1）：
+	// limit=3 取最新 3 行=chat 消息 2 行+progress 1 行穿插。
+	got, err = s.QuerySessionTimeline(s1, c1, "executor", 3)
+	if err != nil {
+		t.Fatalf("QuerySessionTimeline(s1, limit=3) 失败: %v", err)
+	}
+	if want := []string{"chat:s1-reply", "progress:hook 自动上报", "chat:board->s1"}; !slices.Equal(timelineKinds(got), want) {
+		t.Errorf("s1 时间线 limit=3 = %v，期望 %v（合流后总行数裁剪）", timelineKinds(got), want)
+	}
+	_ = p1
+	_ = m2
+	_ = m1
+	_ = p2
+}
+
+// ---- TestTimelineProgressNoProtocolImpact：协议红线锚（poll·positions 零变化对拍，spec §2.3①）----
+
+// TestTimelineProgressNoProtocolImpact b5-W1 协议红线锚（spec §2.3①）：
+// 同库同会话「仅消息」与「消息+progress」两态对拍——poll 可见集与 GetPositions
+// 双位点（mailbox/dialog）逐值一致：progress_reports 独立表旁路不得触碰 poll
+// 可见性谓词/位点读写/哨兵扫描任何语义（pending 计数=可见集基数随之锁定）。
+// 本测试不引用 Message 新字段，b5-2 落地后即应常绿——防回归钉子。
+func TestTimelineProgressNoProtocolImpact(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-10-02T08:00:00Z"
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, t0)
+	c1 := seedColumn(t, s, pid, "01", "栏目01", ColumnStatusActive, t0)
+	s1 := seedSession(t, s, pid, c1, "executor-A", "executor", t0, t0)
+	s2 := seedSession(t, s, pid, c1, "executor-B", "executor", t0, t0)
+
+	m1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindChat, TargetSessionID: s1, SenderSessionID: 0, SenderLabel: "board-user:张三", Level: "important", Body: "board->s1"}, t0)
+	m2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindDirect, TargetRole: "executor", SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "to-grid"}, t0)
+
+	// 快照：s1/s2 双会话 poll 可见集 + s1 双维度位点（首调惰性落信箱位行，
+	// 幂等后纯读——前后两拍同口径）。
+	snap := func() (s1Seqs, s2Seqs []int64, pos Positions) {
+		t.Helper()
+		got, err := s.PollVisible(pid, c1, "executor", s1, 0, 0, 0)
+		if err != nil {
+			t.Fatalf("PollVisible(s1) 失败: %v", err)
+		}
+		s1Seqs = seqs(got)
+		got, err = s.PollVisible(pid, c1, "executor", s2, 0, 0, 0)
+		if err != nil {
+			t.Fatalf("PollVisible(s2) 失败: %v", err)
+		}
+		s2Seqs = seqs(got)
+		pos, err = s.GetPositions(pid, c1, "executor", s1)
+		if err != nil {
+			t.Fatalf("GetPositions(s1) 失败: %v", err)
+		}
+		return s1Seqs, s2Seqs, pos
+	}
+	beforeS1, beforeS2, beforePos := snap()
+
+	// 插 progress：本会话+他会话各一条（观测域旁路数据落盘）。
+	seedProgress(t, s, s1, "b5", "b5-1", "", "", TestStatusPass, "锚测本会话进度", "2026-10-02T08:05:00Z")
+	seedProgress(t, s, s2, "b5", "b5-2", "", "", TestStatusPass, "锚测他会话进度", "2026-10-02T08:05:00Z")
+
+	afterS1, afterS2, afterPos := snap()
+	if want := []int64{m1, m2}; !slices.Equal(beforeS1, want) {
+		t.Fatalf("前置快照异常（夹具自检）: s1 可见集 = %v，期望 %v", beforeS1, want)
+	}
+	if !slices.Equal(beforeS1, afterS1) {
+		t.Errorf("progress 插入后 s1 poll 可见集漂移: before=%v after=%v（协议红线）", beforeS1, afterS1)
+	}
+	if !slices.Equal(beforeS2, afterS2) {
+		t.Errorf("progress 插入后 s2 poll 可见集漂移: before=%v after=%v（协议红线）", beforeS2, afterS2)
+	}
+	if beforePos != afterPos {
+		t.Errorf("progress 插入后位点漂移: before=%+v after=%+v（协议红线）", beforePos, afterPos)
+	}
+}

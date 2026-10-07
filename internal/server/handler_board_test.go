@@ -321,6 +321,8 @@ func TestBoardDialog(t *testing.T) {
 	//    {seq,body,from_board,created_at,kind,from}（b3-W2 扩两键后冻结面，多一字段
 	//    即契约漂移）；顶层 positions{mailbox,dialog} 恒在且为数值——positions/kind/
 	//    from 键名不含 banned 子串，已读语义检查自然通过（本批不引入已读语义）。
+	//    b5 扩档留痕：本测试夹具无 progress 行，六键断言即 AC15.3 结构锚——键面
+	//    全局冻结已由 b5-W3 解冻扩档（progress 行七键面见 TestBoardDialogTimelineProgress）。
 	raw := doReq(t, h, http.MethodGet, fmt.Sprintf("/api/v1/board/sessions/%d/dialog", s1), nil).Body.String()
 	for _, banned := range []string{"read", "unread", "acked", "receipt"} {
 		if strings.Contains(raw, banned) {
@@ -356,6 +358,9 @@ func TestBoardDialog(t *testing.T) {
 // {seq,body,from_board,created_at,kind,from}、From 装配三分支（direct/chat agent
 // 发=sender_label 非空、chat board 发="-"）、顶层 positions{mailbox,dialog} 恒在
 // 且为数值。
+//
+// b5 扩档留痕：progress 行七键面（六键+progress 可选键）见 TestBoardDialogTimelineProgress
+// ——本测试夹具无 progress 行，六键消息行断言即 AC2 零变化锚，逐字冻结。
 func TestBoardDialogTimelineKeys(t *testing.T) {
 	h, st := newTestEnv(t)
 	pid, cid := seedProjectColumn(t, st, "p-a", store.ProjectStatusActive, "05", store.ColumnStatusActive)
@@ -625,6 +630,117 @@ func TestHeaderExempt(t *testing.T) {
 	//    同 TestProjectRegisterExemptNotLeaky「同路径其余方法」口径）。
 	wantErrBody(t, doHeartbeatReq(t, h, http.MethodGet, "/api/v1/board/messages", "", "", "", ""),
 		http.StatusBadRequest, types.CodeMissingHeader)
+}
+
+// ---- TestBoardDialogTimelineProgress：b5-W3 progress 行键面扩档 ----
+
+// TestBoardDialogTimelineProgress b5-W3：#25 响应 progress 行契约扩档——
+// kind=progress 行=六键+progress 可选键共七键 {seq,body,from_board,kind,from,
+// created_at,progress}，progress 对象恰 {batch,task,test_status,commit_hash}；
+// body=summary、seq=0（不占消息 seq 空间）、from="-"、from_board=false
+// （两态 chip 判据按 from_board 独立于 kind 分支——progress 行天然不挂）；
+// 手动层（batch/task 齐全）与 hook 自动层（batch/task 空白）两形态各一；
+// 消息行恒六键无 progress 键；无 progress 会话响应零变化对偶面。
+func TestBoardDialogTimelineProgress(t *testing.T) {
+	h, st := newTestEnv(t)
+	pid, cid := seedProjectColumn(t, st, "p-a", store.ProjectStatusActive, "05", store.ColumnStatusActive)
+	exe := seedBoardSession(t, h, st, "p-a", "05", "executor-A", "executor")
+	exe2 := seedBoardSession(t, h, st, "p-a", "05", "executor-B", "executor")
+	seedBoardMessage(t, st, store.MessageInput{
+		ProjectID: pid, ColumnID: cid,
+		Kind: store.MessageKindChat, TargetSessionID: exe,
+		SenderLabel: "board-user", Level: store.MessageLevelNormal, Body: "board 问询",
+	})
+	// 手动层一条（batch/task 齐全）+ hook 自动层一条（batch/task 空白、带 hash）。
+	if _, err := st.InsertProgress(store.ProgressReport{
+		SessionID: exe, Batch: "b5", Task: "b5-3",
+		TestStatus: store.TestStatusPass, Summary: "TDD 转绿一条",
+	}); err != nil {
+		t.Fatalf("种手动层进度失败: %v", err)
+	}
+	if _, err := st.InsertProgress(store.ProgressReport{
+		SessionID: exe, CommitHash: "abc1234def5678", Branch: "feat/b5-1",
+		TestStatus: store.TestStatusFail, Summary: "hook 自动上报一条",
+	}); err != nil {
+		t.Fatalf("种自动层进度失败: %v", err)
+	}
+	seedBoardMessage(t, st, store.MessageInput{
+		ProjectID: pid, ColumnID: cid,
+		Kind: store.MessageKindChat, TargetSessionID: exe, SenderSessionID: exe2,
+		SenderLabel: "executor-B@05", Level: store.MessageLevelNormal, Body: "agent 回复",
+	})
+
+	code, m := boardGet(t, h, fmt.Sprintf("/api/v1/board/sessions/%d/dialog", exe))
+	if code != http.StatusOK {
+		t.Fatalf("GET #25 status = %d, want 200（body: %v）", code, m)
+	}
+	list := assertBoardMessages(t, m)
+	if len(list) != 4 {
+		t.Fatalf("合流时间线条数 = %d, want 4（两消息+两 progress）", len(list))
+	}
+	msgRows, progRows := 0, 0
+	for i, row := range list {
+		r, _ := row.(map[string]any)
+		keys := map[string]bool{}
+		for k := range r {
+			keys[k] = true
+		}
+		if r["kind"] == "progress" {
+			progRows++
+			if len(keys) != 7 || !keys["seq"] || !keys["body"] || !keys["from_board"] ||
+				!keys["kind"] || !keys["from"] || !keys["created_at"] || !keys["progress"] {
+				t.Errorf("messages[%d] progress 行键集合 = %v, want 恰七键 {seq,body,from_board,kind,from,created_at,progress}", i, keys)
+			}
+			if r["from_board"] != false || r["from"] != "-" {
+				t.Errorf("messages[%d] from_board/from = %v/%v, want false/\"-\"（chip 天然不挂）", i, r["from_board"], r["from"])
+			}
+			if n, ok := r["seq"].(float64); !ok || n != 0 {
+				t.Errorf("messages[%d] seq = %v, want 0（不占消息 seq 空间）", i, r["seq"])
+			}
+			det, ok := r["progress"].(map[string]any)
+			if !ok {
+				t.Fatalf("messages[%d] 缺 progress 对象键: %v", i, r)
+			}
+			dkeys := map[string]bool{}
+			for k := range det {
+				dkeys[k] = true
+			}
+			if len(dkeys) != 4 || !dkeys["batch"] || !dkeys["task"] || !dkeys["test_status"] || !dkeys["commit_hash"] {
+				t.Errorf("messages[%d] progress 对象键集合 = %v, want 恰 {batch,task,test_status,commit_hash}", i, dkeys)
+			}
+		} else {
+			msgRows++
+			if len(keys) != 6 || keys["progress"] {
+				t.Errorf("messages[%d] 消息行键集合 = %v, want 恰六键且无 progress 键", i, keys)
+			}
+		}
+	}
+	if msgRows != 2 || progRows != 2 {
+		t.Errorf("行数分布 = %d 消息/%d progress, want 2/2", msgRows, progRows)
+	}
+	// 自动层四字段抽验：batch/task 空串（hook 层空白形态）+test_status/hash 原值。
+	for _, row := range list {
+		r, _ := row.(map[string]any)
+		if r["body"] == "hook 自动上报一条" {
+			det, ok := r["progress"].(map[string]any)
+			if !ok {
+				t.Fatalf("自动层抽验行缺 progress 对象键: %v", r)
+			}
+			if det["batch"] != "" || det["task"] != "" {
+				t.Errorf("自动层 batch/task = %v/%v, want 空串", det["batch"], det["task"])
+			}
+			if det["test_status"] != "fail" || det["commit_hash"] != "abc1234def5678" {
+				t.Errorf("自动层 test_status/commit_hash = %v/%v, want fail/abc1234def5678", det["test_status"], det["commit_hash"])
+			}
+		}
+	}
+	// 无 progress 会话零变化对偶面：exe2 时间线零行（本夹具无发给 exe2 的消息、
+	// 无 exe2 进度）——messages 空数组+positions 恒在；六键消息行零变化的强锚=
+	// 既有 TestBoardDialogTimelineKeys（本批断言零改动，其夹具无 progress 行）。
+	_, m2 := boardGet(t, h, fmt.Sprintf("/api/v1/board/sessions/%d/dialog", exe2))
+	if rows := assertBoardMessages(t, m2); len(rows) != 0 {
+		t.Errorf("无 progress 会话时间线 = %d 行, want 0", len(rows))
+	}
 }
 
 // queryBoardMessages 拉全部消息行（seq 序，落库断言面）。

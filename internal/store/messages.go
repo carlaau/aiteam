@@ -17,6 +17,11 @@ const (
 	MessageKindBus     = "bus"     // 总线：column_id=发送方所在栏目（审计锚点），项目级可见
 	MessageKindChat    = "chat"    // 看板对话：column_id=目标会话所属栏目，target_session_id=目标会话
 	MessageKindReceipt = "receipt" // 回执回告：column_id=原发送方会话栏目，target_session_id=原发送方会话
+
+	// MessageKindProgress 合成 kind（b5）：不落 messages 表（DDL kind 枚举
+	// direct/bus/chat/receipt 零动）——QuerySessionTimeline progress 合流行的
+	// Kind 标记值，handler #25 据此装配 progress 可选键、前端据此分组渲染。
+	MessageKindProgress = "progress"
 )
 
 // 消息 level 枚举（DDL CHECK (level IN ('normal','important','block'))）。
@@ -70,6 +75,14 @@ type Message struct {
 	Level           string // normal | important | block
 	Body            string
 	CreatedAt       string // 服务端时间（AC5.4，types.NowUTC 注入）
+
+	// —— b5 时间线 progress 行装配面（QuerySessionTimeline 专用，消息行恒空串）——
+	// Message 无 json tag 属 store 内部结构，扩字段零协议泄漏（b5-spec §2.1，
+	// HTTP 面恒走 handler 专用 row 结构）。§7.1 裁量点 1：Message 扩 4 字段形态。
+	ProgressBatch      string // progress 行=progress_reports.batch（NULL→''）；消息行 ""
+	ProgressTask       string // progress 行=progress_reports.task；消息行 ""
+	ProgressTestStatus string // progress 行=test_status（pass|fail|unknown）；消息行 ""
+	ProgressCommitHash string // progress 行=commit_hash；消息行 ""
 }
 
 // MessageInput InsertMessage 入参：column_id 与 target 字段由调用方按 kind 归属
@@ -461,32 +474,59 @@ func (s *Store) QueryDialog(sessionID int64, limit int) ([]Message, error) {
 	return out, nil
 }
 
-// QuerySessionTimeline 会话时间线合流查询（b3-W1，看板对话合流/未读角标数据面）：
-// chat（目标会话命中——board 发送与目标会话自发回复双向都进流，QueryDialog 全流
-// 语义同款）+ direct（目标（栏目,角色）命中——会话所在信箱的定向消息合流进同一
-// 时间线）两路 OR 合一，按 seq DESC（最新在前，§3.1 seq 单调递增=时间序）。
+// QuerySessionTimeline 会话时间线合流查询（b3-W1 引入两路，b5-W2 扩第三路
+// progress）：chat（目标会话命中——board 发送与目标会话自发回复双向都进流，
+// QueryDialog 全流语义同款）+ direct（目标（栏目,角色）命中——会话所在信箱的
+// 定向消息合流进同一时间线）+ progress（观测域旁路合流——progress_reports.
+// session_id 命中）三路 UNION ALL，created_at 归一 DESC（messages 与
+// progress_reports 的 created_at 同源 types.NowUTC ISO8601 UTC，字典序=时间序；
+// 同刻 tie-break=seq DESC 后 p_id DESC——消息行 seq 全局唯一、progress 行 seq
+// 恒 0 按 progress_reports.id 决序，确定性可复现，§7.2 裁量点 2 推荐口径，
+// 执行者可裁报备）。
 //
-// Q2 冻结 SQL（tech-design §3.6）逐字采用——WHERE/ORDER/LIMIT 谓词不改写；SELECT
-// 列面按本文件读路径冻结惯例用 messageSelectColumns 前缀版（复用 scanMessage
-// 装配、列序恒定——设计稿 6 列摘要形态装不满 Message 行，属列面适配非谓词改写）。
+// b5 硬边界：progress 行 Seq 恒 0——不占用 messages seq 空间（AUTOINCREMENT
+// 取号只归消息行），前端一切以 seq 为锚的机制（超长折叠记忆/chip 比对/pruneSeqSet）
+// 对 progress 行无意义；progress 四字段仅 progress 行装配（ProgressBatch/Task/
+// TestStatus/CommitHash），Body=summary，Kind='progress'（合成标记值，
+// messages.kind DDL 枚举不受涉）。
 //
-// limit：<=0=DefaultDialogLimit(100)（QueryDialog 同惯例）；空命中返回非 nil
-// 空切片（JSON null 防线）。
+// chat/direct 两路谓词=Q2 冻结 SQL（tech-design §3.6）拆 UNION 语义等价改写，
+// WHERE 谓词逐字不动（TestQuerySessionTimeline 既有断言+TestQuerySessionTimeline
+// Progress 双测回归锁定）。
 //
-// 已知代价（pollVisibleSQL 同款登记，量级上来再议）：两路 OR 合一随数据量线性扫
-// （chat 分支有 idx_messages_chat 部分索引、direct 分支有 idx_messages_direct
-// 前缀索引支撑）；量大后可演进为两分支 UNION ALL 归并各走索引——当前单机
-// SQLite+万级消息量下 OR 形态足够。
+// limit：<=0=DefaultDialogLimit(100)（QueryDialog 同惯例）；LIMIT=合流后总行数
+// 裁剪（progress 行与消息行同权计入窗口，挤占保底后备=§7.3 走查实证再议）；
+// 空命中返回非 nil 空切片（JSON null 防线）。
+//
+// 已知代价（b5-W2 更新为 UNION 形态账）：三路各走既有索引（chat=idx_messages_chat
+// 部分索引/direct=idx_messages_direct 前缀/progress=idx_progress_session_time
+// 前缀命中），原两路 OR 线性扫代价段被 UNION 拆分顺带改善；本查询即 messages.go
+// 既有注释登记的「量大后演进为分支 UNION ALL 归并各走索引」预留路径顺延。
 func (s *Store) QuerySessionTimeline(sessionID, columnID int64, role string, limit int) ([]Message, error) {
 	if limit <= 0 {
 		limit = DefaultDialogLimit
 	}
 	rows, err := s.DB.Query(
-		`SELECT `+messageSelectColumns+` FROM messages m
-WHERE (m.kind = 'chat' AND m.target_session_id = ?)
-   OR (m.kind = 'direct' AND m.column_id = ? AND m.target_role = ?)
-ORDER BY m.seq DESC LIMIT ?`,
-		sessionID, columnID, role, limit,
+		`SELECT m.seq, m.project_id, m.column_id, m.kind, m.target_role, m.target_session_id,
+       m.sender_session_id, m.sender_label, m.level, m.body, m.created_at,
+       '' AS p_batch, '' AS p_task, '' AS p_test, '' AS p_hash, 0 AS p_id
+	FROM messages m
+	WHERE (m.kind = 'chat' AND m.target_session_id = ?)
+	UNION ALL
+	SELECT m.seq, m.project_id, m.column_id, m.kind, m.target_role, m.target_session_id,
+	       m.sender_session_id, m.sender_label, m.level, m.body, m.created_at,
+	       '', '', '', '', 0
+	FROM messages m
+	WHERE (m.kind = 'direct' AND m.column_id = ? AND m.target_role = ?)
+	UNION ALL
+	SELECT 0, 0, 0, 'progress', '', 0,
+	       0, '', 'normal', COALESCE(p.summary, ''), p.created_at,
+	       COALESCE(p.batch, ''), COALESCE(p.task, ''), COALESCE(p.test_status, ''), COALESCE(p.commit_hash, ''), p.id
+	FROM progress_reports p
+	WHERE p.session_id = ?
+	ORDER BY created_at DESC, seq DESC, p_id DESC
+	LIMIT ?`,
+		sessionID, columnID, role, sessionID, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: 会话时间线查询失败: %w", err)
@@ -494,7 +534,7 @@ ORDER BY m.seq DESC LIMIT ?`,
 	defer rows.Close()
 	out := make([]Message, 0)
 	for rows.Next() {
-		m, err := scanMessage(rows.Scan)
+		m, err := scanTimelineRow(rows.Scan)
 		if err != nil {
 			return nil, fmt.Errorf("store: 扫描会话时间线行失败: %w", err)
 		}
@@ -504,6 +544,25 @@ ORDER BY m.seq DESC LIMIT ?`,
 		return nil, fmt.Errorf("store: 遍历会话时间线失败: %w", err)
 	}
 	return out, nil
+}
+
+// scanTimelineRow 从一行解出 QuerySessionTimeline 合流行（b5-W2）：16 列=消息
+// 本位 11 列+progress 装配 4 列+排序列 p_id（仅 SQL ORDER BY 消费，Go 侧弃扫进
+// 局部变量——progress_reports.id 不入 Message，防与消息 seq 空间串号）。可空列
+// 已在 SQL 侧 COALESCE/字面量兜成非 NULL，直接扫 string。
+func scanTimelineRow(scan func(dest ...any) error) (Message, error) {
+	var (
+		m   Message
+		pID int64
+	)
+	err := scan(&m.Seq, &m.ProjectID, &m.ColumnID, &m.Kind, &m.TargetRole,
+		&m.TargetSessionID, &m.SenderSessionID, &m.SenderLabel,
+		&m.Level, &m.Body, &m.CreatedAt,
+		&m.ProgressBatch, &m.ProgressTask, &m.ProgressTestStatus, &m.ProgressCommitHash, &pID)
+	if err != nil {
+		return Message{}, err
+	}
+	return m, nil
 }
 
 // InsertBoardMessageWithAudit 看板消息落库+审计同事务（§2.2 #24「同事务 INSERT

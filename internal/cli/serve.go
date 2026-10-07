@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -133,6 +134,29 @@ func serve(ctx context.Context, args []string, ready func(addr string)) error {
 		return fmt.Errorf("创建数据库目录 %s 失败: %w", dbDir, err)
 	}
 
+	// serve 单例锁（b1）：db 目录级 OS 独占锁，在开库之前取得——同库目录已有活
+	// 实例时启动即拒（多实例同库互抢写入的防线）。defer 盖全后续早退路径（开库/
+	// Listen 失败等 shutdown 链之外的所有 return）；优雅停机分支另显式 release
+	// 一次（幂等，日志语义）。失败两类文案均退 1=普通 error（不包 ErrUsage——
+	// 用法错才退 2，映射在 main 层 serveCmd）。
+	lockPath := filepath.Join(dbDir, serveLockFile)
+	lockAbs := lockPath
+	if abs, absErr := filepath.Abs(lockPath); absErr == nil {
+		lockAbs = abs
+	}
+	release, holder, lockErr := acquireServeLock(dbDir)
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrLocked) {
+			// 被占类：三要件文案（锁文件路径+持有者信息+按 PID 处置指引）。
+			// 错误链在此有意截断（分类已在上方 errors.Is(lockErr, ErrLocked) 完成；
+			// main 层仅认 ErrUsage，无需程序化区分）
+			return errors.New(serveLockHeldMessage(lockAbs, holder, cfg.Listen))
+		}
+		// 创建失败类：系统错误如实上报，不附持有者诊断
+		return fmt.Errorf("创建 serve 单例锁失败: %w", lockErr)
+	}
+	defer release()
+
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("打开数据库失败: %w", err)
@@ -146,24 +170,29 @@ func serve(ctx context.Context, args []string, ready func(addr string)) error {
 		return fmt.Errorf("监听 %s 失败: %w", cfg.Listen, err)
 	}
 
+	// db 绝对路径（横幅与摘要回写共用）：解析失败回落原值不阻塞启动
+	dbAbs := dbPath
+	if abs, absErr := filepath.Abs(dbAbs); absErr == nil {
+		dbAbs = abs
+	}
+	// Listen 成功后回写完整持有者摘要（C1 裁量）：listen/db 补齐后第二实例被拒的
+	// 诊断才含 listen（对齐 spec 报错示例）；尽力而为，失败仅 Warn 不影响启动
+	rewriteServeLockSummary(dbDir, ln.Addr().String(), dbAbs)
+
 	srv := &http.Server{Handler: handler}
 	if ready != nil {
 		ready(ln.Addr().String())
 	}
-	// 启动横幅：db/config 一律打印已解析的绝对路径——部署根语义下落点一眼可辨
-	// （库文件写进系统目录事故的防线之二：看日志即知落点异常）；解析失败回落原值
-	// 不阻塞启动。生成失败回落内建默认时 config 显示 <内建默认>。
-	dbAbs := dbPath
-	if abs, err := filepath.Abs(dbAbs); err == nil {
-		dbAbs = abs
-	}
+	// 启动横幅：db/config/锁文件一律打印已解析的绝对路径——部署根语义下落点一眼
+	// 可辨（库文件写进系统目录事故的防线之二：看日志即知落点异常）；解析失败回落
+	// 原值不阻塞启动。生成失败回落内建默认时 config 显示 <内建默认>。
 	cfgSrc := cfgPath
 	if cfgSrc == "" {
 		cfgSrc = "<内建默认>"
-	} else if abs, err := filepath.Abs(cfgSrc); err == nil {
+	} else if abs, absErr := filepath.Abs(cfgSrc); absErr == nil {
 		cfgSrc = abs
 	}
-	slog.Info("aiteam 服务已启动", "listen", ln.Addr().String(), "db", dbAbs, "config", cfgSrc, "version", server.Version)
+	slog.Info("aiteam 服务已启动", "listen", ln.Addr().String(), "db", dbAbs, "config", cfgSrc, "version", server.Version, "lock", lockAbs)
 
 	serveErr := make(chan error, 1) // 带缓冲：停机路径不读它，Serve goroutine 不泄漏
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -179,7 +208,12 @@ func serve(ctx context.Context, args []string, ready func(addr string)) error {
 		}
 		return fmt.Errorf("服务异常退出: %w", err)
 	case <-ctx.Done():
-		return shutdown(srv, st)
+		serr := shutdown(srv, st)
+		// 优雅停机路径显式释放单例锁（幂等，defer 兜底不变）：锁的存续盖到全部
+		// in-flight 请求收敛之后，「已释放」日志落在本调用处
+		release()
+		slog.Info("serve 单例锁已释放", "lock", lockAbs)
+		return serr
 	}
 }
 
@@ -198,4 +232,64 @@ func shutdown(srv *http.Server, st *store.Store) error {
 	}
 	slog.Info("aiteam 服务已优雅停机")
 	return nil
+}
+
+// serveLockHeldMessage 构造单例锁被占的报错文案（spec 三要件：锁文件路径+持有者
+// 信息+按 PID 处置指引）：持有者摘要解析出 pid 则如例格式化，listen 在位则附
+// （取锁后未及 Listen 即退出的残留只有 pid）；摘要读取失败/为空/不可解析降级
+// 「持有者信息不可读」，句式结构不变。netstat 定位端口优先取持有者 listen 的
+// 端口，缺省回落本次配置监听端口；随机端口（:0）无定位意义，省略命令提示。
+func serveLockHeldMessage(lockPath, holder, cfgListen string) string {
+	port := ""
+	if _, p, err := net.SplitHostPort(cfgListen); err == nil && p != "0" {
+		port = p
+	}
+	holderText := "持有者信息不可读"
+	var info serveLockInfo
+	if holder != "" && json.Unmarshal([]byte(holder), &info) == nil && info.PID > 0 {
+		holderText = fmt.Sprintf("持有者 pid=%d", info.PID)
+		if info.Listen != "" {
+			holderText += "，listen " + info.Listen
+			if _, p, err := net.SplitHostPort(info.Listen); err == nil {
+				port = p
+			}
+		}
+	}
+	hint := ""
+	if port != "" {
+		hint = fmt.Sprintf("（netstat -ano | findstr :%s）", port)
+	}
+	return fmt.Sprintf("serve 单例锁被占：本库目录已有实例在跑（%s，锁=%s）——多实例同库会互抢写入，如为残留进程请按 PID 处置%s",
+		holderText, lockPath, hint)
+}
+
+// rewriteServeLockSummary Listen 成功后回写完整持有者摘要（C1 裁量）：把取锁时点
+// 的摘要（pid/db_dir/start_at）补上 listen（实际监听地址）与 db（库文件绝对路径）。
+// 新开句柄在锁字节之后截断重写（口径同 writeServeLockSummary：Truncate+WriteAt，
+// 绕开锁字节，排他性不受影响）；尽力而为——任何失败仅 Warn，不影响启动。
+func rewriteServeLockSummary(dbDir, listen, db string) {
+	f, err := os.OpenFile(filepath.Join(dbDir, serveLockFile), os.O_WRONLY, 0o644)
+	if err != nil {
+		slog.Warn("serve 锁摘要回写打开失败（不影响启动）", "err", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	b, err := json.Marshal(serveLockInfo{
+		PID:     os.Getpid(),
+		DBDir:   dbDir,
+		Listen:  listen,
+		DB:      db,
+		StartAt: time.Now().Format(time.RFC3339),
+	})
+	if err != nil {
+		slog.Warn("serve 锁摘要回写序列化失败（不影响启动）", "err", err)
+		return
+	}
+	if err := f.Truncate(serveLockSummaryOffset); err != nil {
+		slog.Warn("serve 锁摘要回写截断失败（不影响启动）", "err", err)
+		return
+	}
+	if _, err := f.WriteAt(b, serveLockSummaryOffset); err != nil {
+		slog.Warn("serve 锁摘要回写失败（不影响启动）", "err", err)
+	}
 }
