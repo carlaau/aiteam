@@ -731,6 +731,26 @@ b { font-weight: 600; }
 .chip-delivered { background: var(--pill-neutral-bg); color: var(--text-2); }
 .chip-done { background: var(--pill-ok-bg); color: var(--ok); }
 
+/* ==================== 以下为 b5-T4 撤回占位行增量 ==================== */
+
+/* ---------- 撤回占位行（b5-T4/AC3②③：recalled=true 行渲「消息已由发送方撤回」，
+   服务端已剥 body——wire body 恒空串，占位文案归前端装配） ----------
+   低调灰化+斜体（--text-3 占位字色族，同 .placeholder 既有语义）；对话页形态
+   覆写：.msg-row .msg-body.recalled-placeholder（specificity 0,3,0）压过行形态
+   规则（.from-board/.from-agent 气泡底与 .kind-direct/.kind-other 左线等宽体
+   ——撤回占位与来源 kind 无关，统一素行）。只用既有 CSS 变量零裸色值（闸④），
+   亮暗两主题经 :root/媒体查询/data-theme 变量组级联自动覆盖。 */
+.recalled-placeholder { color: var(--text-3); font-style: italic; }
+.msg-row .msg-body.recalled-placeholder {
+  display: block;
+  background: transparent;
+  border-left: none;
+  border-radius: 0;
+  padding: 2px 8px;
+  font-family: inherit;
+  text-align: inherit;
+}
+
 /* ==================== 以下为 b4-W4 空态引导+会话行两行制增量 ==================== */
 
 /* 空态引导（b4-W4/AC6）：#dialog-log 内纵向居中；树空态同用两级文案 */

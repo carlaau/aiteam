@@ -40,10 +40,22 @@ const (
 	AuditColumnArchive   = "column.archive"
 )
 
+// 反归档域审计动作（M-31，b1 随写入侧定义追加）：archive 动词的逆操作各一，
+// 命名对齐 project.*/column.* 前缀惯例（b1-spec §2.1，归档往返账两态各留痕）。
+const (
+	AuditProjectUnarchive = "project.unarchive"
+	AuditColumnUnarchive  = "column.unarchive"
+)
+
 // AuditBoardMessage 看板唯一写口 #24 的消息留痕（§3.2 审计枚举，B5-1 随写入侧
 // 定义）：看板无会话身份（sender_session_id=0 系统动作），审计是看板发送唯一
 // 的操作者归因面。
 const AuditBoardMessage = "board.message"
+
+// AuditMessageRecall 消息撤回留痕（b5-spec R2.2，随写入侧定义追加）：RecallMessageWithAudit
+// 单事务落墓碑+审计（AC3①）；幂等重放照记（每次撤回动作都留痕，archive 家族
+// 重放留痕同口径）。
+const AuditMessageRecall = "message.recall"
 
 // audit limit 口径（§2.2 #28：limit 默认 100、最大 1000）。
 const (

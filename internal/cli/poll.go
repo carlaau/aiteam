@@ -54,6 +54,18 @@ type pollData struct {
 	CrossGridHint   []pollCrossGridHint `json:"cross_grid_hint,omitempty"`
 }
 
+// pollAckData `poll --ack --json` 输出结构（b2-T3 additive）：pollData 原键面
+// 原序整体前置 + acked_to 尾键（本次推进落定的信箱位点）。acked_to 键缺省
+// 口径（b2-spec §二.R1「未拉到为 null/省略」二择一取省略）：未带 --ack 或
+// --ack 空信箱零推进时键缺省——与 cross_grid_hint 的 additive/omitempty 口径
+// 一致，且空信箱时 --ack 与不带 --ack 的 --json 输出逐字节一致（AC1②）；
+// 非 ack 路径序列化产物与 pollData 逐字节相同（嵌入字段面原序前置零改写，
+// TestPollOutput 恰三键断言为回归锚）。
+type pollAckData struct {
+	pollData
+	AckedTo int64 `json:"acked_to,omitempty"`
+}
+
 // defaultPollLimit poll 缺省上限（D8 裁定：默认 500 条分页，--limit 0 显式要
 // 全量；与服务端 store.DefaultPollLimit 同值口径，服务端调整须同步）。
 const defaultPollLimit = 500
@@ -68,14 +80,15 @@ func RunPoll(args []string) int {
 // 身份四头，column/role/session 走 #10 query 三参（§2.2 #10 原文口径）。
 func runPoll(ctx context.Context, args []string, serverOverride string) int {
 	fs := newFlagSet("aiteam poll",
-		"用法: aiteam poll [--limit <n>] [--json] "+identityUsage+
+		"用法: aiteam poll [--limit <n>] [--json] [--ack] "+identityUsage+
 			"（信箱=--column+--role，对话=--session 同拉）")
 	var id identityFlags
 	var limit int
-	var asJSON bool
+	var asJSON, ack bool
 	registerCommonFlags(fs, &id)
 	fs.IntVar(&limit, "limit", defaultPollLimit, "单次拉取上限（缺省 500 条分页；0=显式要全量）")
 	fs.BoolVar(&asJSON, "json", false, "机器可读 JSON 输出（与 #10 响应同构）")
+	fs.BoolVar(&ack, "ack", false, "拉到信箱消息即自动推进位点（等价紧接 ack --seq <本次最大信箱 seq>；空信箱零动作）")
 	if proceed, exit := parseFlags(fs, args); !proceed {
 		return exit
 	}
@@ -100,8 +113,38 @@ func runPoll(ctx context.Context, args []string, serverOverride string) int {
 	if err := c.Do(ctx, http.MethodGet, "/api/v1/mailbox?"+q.Encode(), nil, &resp); err != nil {
 		return fail(err) // UnreachableError→3 / APIError→4（mapExitCode 既有分流）
 	}
+	// b2-T3 --ack 一键消费（b2-spec §二.R1/M-32）：本次拉到信箱域消息
+	// （kind=direct/bus，maxAckedSeq）则紧接一次 #11 显式 seq 推进，等价
+	// `ack --seq <本次最大信箱 seq>`——纯客户端链 poll→ack 两次服务端调用，
+	// 服务端零变化。口径三点：
+	//   ① 推进目标只取信箱域最大 seq——#11 --seq 推的就是信箱位点，chat/
+	//     receipt 归对话流（§3.6 谓词三分支）；#11 显式 seq 双维度同推到该值
+	//     （既有语义），不超过该值的对话消息（本次已一并展示）随之消费。
+	//   ② 空信箱零动作零输出差异：max=0 不发请求，文本/--json 输出与不带
+	//     --ack 逐字节一致（--json 的 acked_to 键缺省，见 pollAckData 注）。
+	//   ③ 推进调用先于输出渲染：#11 失败则整命令非零退出且不展示（GET 只读
+	//     零位点变化，重跑无损；与 ack.go「位点先行、失败零副作用」恢复哲学
+	//     同源）——成功后 acked_to 随 --json 尾注。
+	ackedTo := int64(0)
+	if ack {
+		if max := maxAckedSeq(resp.Messages); max > 0 {
+			q := url.Values{}
+			q.Set("column", ident.Column)
+			q.Set("role", ident.Role)
+			q.Set("session", ident.Session)
+			q.Set("seq", strconv.FormatInt(max, 10))
+			var pos ackData
+			if err := c.Do(ctx, http.MethodPost, "/api/v1/acks?"+q.Encode(), nil, &pos); err != nil {
+				return fail(err)
+			}
+			// #11 响应信箱位点=推进落定值（position=max 幂等下即本次最大信箱 seq）。
+			ackedTo = pos.MailboxPosition
+		}
+	}
 	if asJSON {
-		b, err := json.Marshal(resp)
+		// pollAckData 包装（b2-T3）：非 ack 路径（AckedTo=0 键缺省）序列化产物
+		// 与 pollData 逐字节相同，单一代码路径零分叉。
+		b, err := json.Marshal(pollAckData{pollData: resp, AckedTo: ackedTo})
 		if err != nil {
 			return fail(fmt.Errorf("JSON 序列化失败: %w", err))
 		}
@@ -126,6 +169,24 @@ func senderLabel(s pollSenderData) string {
 		return "-"
 	}
 	return s.Session + "@" + s.Column
+}
+
+// maxAckedSeq 本次拉到的信箱域消息（kind=direct/bus）最大 seq，无信箱域消息
+// 则 0。--ack 推进目标口径（b2-spec §二.R1）：#11 --seq 推的就是信箱位点，
+// chat/receipt 归对话流（§3.6 谓词三分支）不纳入取值——chat seq 高于信箱最大
+// 时保持未消费（TestPollAckMailboxDomainOnly 守门）。纯函数零 IO，与
+// renderPollOutput 同层（data→值，测试逐字对拍）。
+func maxAckedSeq(msgs []pollMessageData) int64 {
+	var max int64
+	for _, m := range msgs {
+		if m.Kind != "direct" && m.Kind != "bus" {
+			continue
+		}
+		if m.Seq > max {
+			max = m.Seq
+		}
+	}
+	return max
 }
 
 // renderPollOutput §4.2 输出样例的纯函数渲染（data→文本，零 IO 零时钟，测试

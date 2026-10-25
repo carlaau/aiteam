@@ -450,7 +450,10 @@ type receiptData struct {
 }
 
 // historyMessageData #13 响应 messages 元素（§2.2 #13 恰七键）。sender 与 #10
-// 同构（messageSenderData 复用）；receipt 指针 nil=未回执。
+// 同构（messageSenderData 复用）；receipt 指针 nil=未回执。b5-T4 additive 扩档：
+// Recalled 指针型 bool+omitempty——非墓碑行键不出现（七键冻结面零漂移），墓碑行
+// recalled:true；Body 恒透传 store 值（墓碑行已在 SQL 层剥空，看板只显占位不显
+// body 的硬闸在 store 读面单点，本 handler 无二次裁剪面）。
 type historyMessageData struct {
 	Seq       int64             `json:"seq"`
 	Kind      string            `json:"kind"`
@@ -459,6 +462,7 @@ type historyMessageData struct {
 	Sender    messageSenderData `json:"sender"`
 	Receipt   *receiptData      `json:"receipt"`
 	CreatedAt string            `json:"created_at"`
+	Recalled  bool              `json:"recalled,omitempty"` // b5-T4：墓碑行 true（非墓碑行键缺省）
 }
 
 // historyData 端点 #13 响应 data（§2.2 #13：恰 {messages} 一键）。
@@ -577,6 +581,7 @@ func (s *Server) handleMessageHistory(w http.ResponseWriter, r *http.Request) {
 			Body:      m.Body,
 			Sender:    messageSenderData{Session: refs[m.SenderSessionID].Session, Role: refs[m.SenderSessionID].Role, Column: refs[m.SenderSessionID].Column},
 			CreatedAt: m.CreatedAt,
+			Recalled:  m.Recalled, // b5-T4：墓碑行 true+body 已剥空（SQL 层单源硬闸）
 		}
 		if rec, ok := receipts[m.Seq]; ok {
 			row.Receipt = &receiptData{By: refs[rec.ReceiptBy].Session, At: rec.ReceiptAt}

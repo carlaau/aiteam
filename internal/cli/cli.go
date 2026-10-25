@@ -180,7 +180,7 @@ func fail(err error) int {
 // RunProjectGroup `aiteam project <动词>` 分发（§4.3 登记组 project 族）。
 func RunProjectGroup(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: aiteam project <register|update|archive|list> [参数]（"+identityUsage+"）")
+		fmt.Fprintln(os.Stderr, "用法: aiteam project <register|update|archive|unarchive|list> [参数]（"+identityUsage+"）")
 		return 2
 	}
 	ctx := context.Background()
@@ -191,10 +191,12 @@ func RunProjectGroup(args []string) int {
 		return runProjectUpdate(ctx, args[1:], "")
 	case "archive":
 		return runProjectArchive(ctx, args[1:], "")
+	case "unarchive":
+		return runProjectUnarchive(ctx, args[1:], "")
 	case "list":
 		return runProjectList(ctx, args[1:], "")
 	default:
-		fmt.Fprintf(os.Stderr, "ERROR: 未知 project 动词 %q\n用法: aiteam project <register|update|archive|list>\n", args[0])
+		fmt.Fprintf(os.Stderr, "ERROR: 未知 project 动词 %q\n用法: aiteam project <register|update|archive|unarchive|list>\n", args[0])
 		return 2
 	}
 }
@@ -202,7 +204,7 @@ func RunProjectGroup(args []string) int {
 // RunColumnGroup `aiteam column <动词>` 分发（§4.3 登记组 column 族）。
 func RunColumnGroup(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: aiteam column <register|update|archive|list> [参数]（"+identityUsage+"）")
+		fmt.Fprintln(os.Stderr, "用法: aiteam column <register|update|archive|unarchive|list> [参数]（"+identityUsage+"）")
 		return 2
 	}
 	ctx := context.Background()
@@ -213,10 +215,12 @@ func RunColumnGroup(args []string) int {
 		return runColumnUpdate(ctx, args[1:], "")
 	case "archive":
 		return runColumnArchive(ctx, args[1:], "")
+	case "unarchive":
+		return runColumnUnarchive(ctx, args[1:], "")
 	case "list":
 		return runColumnList(ctx, args[1:], "")
 	default:
-		fmt.Fprintf(os.Stderr, "ERROR: 未知 column 动词 %q\n用法: aiteam column <register|update|archive|list>\n", args[0])
+		fmt.Fprintf(os.Stderr, "ERROR: 未知 column 动词 %q\n用法: aiteam column <register|update|archive|unarchive|list>\n", args[0])
 		return 2
 	}
 }

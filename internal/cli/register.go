@@ -10,17 +10,17 @@ import (
 )
 
 // 本文件为登记命令族实现（B1-8，技术设计 §4.3 登记组 + §4.6 辅助命令）：
-// project/column 两族八命令 + session list + audit，共十个命令函数。
+// project/column 两族十命令 + session list + audit，共十二个命令函数。
 //
 // 参数面裁定（b1-spec 死锁的工程解，测试与实现一致）：心跳中间件要求身份四头的
 // project/column 已登记（否则 404 短路），而登记命令的目标实体尚未存在——身份与
 // 目标必须分离。全局身份四参（--project/--column/--session/--role，§4.1）表达
 // 操作者所在域；目标实体统一用 --code flag：
-//   - project register/update/archive --code <待操作项目code>
-//   - column register/update/archive --project <父项目> --code <待操作栏目code>
+//   - project register/update/archive/unarchive --code <待操作项目code>
+//   - column register/update/archive/unarchive --project <父项目> --code <待操作栏目code>
 //
 // column 族 --project 一参两用=身份 project+父项目（同值自洽，无死锁）；column
-// update/archive 的 --code 目标已登记，身份栏目仍挂操作者自身域。查询命令按实际
+// update/archive/unarchive 的 --code 目标已登记，身份栏目仍挂操作者自身域。查询命令按实际
 // 行为分口径：session list 的 --project 兼作过滤（端点 #27 同口径）；audit 的
 // --project 仅作身份、查询不带项目过滤——登记目标常是异项目，按身份过滤会滤掉其
 // 留痕（AC1.4 可查性优先，规格 [--project] 过滤语义的取舍已随死锁上报总控）。
@@ -36,7 +36,8 @@ type projectResp struct {
 	Code string `json:"code"`
 }
 
-// archiveResp DELETE 响应 data（§2.2 #3/#7：恰 {status:"archived"}）。
+// archiveResp DELETE 响应 data（§2.2 #3/#7：恰 {status:"archived"}；M-31 两族
+// unarchive 逆动词复用同字段面，服务端 status 传 active）。
 type archiveResp struct {
 	Status string `json:"status"`
 }
@@ -91,7 +92,7 @@ type auditListResp struct {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// project 族（§4.3：register/update/archive/list，与 column 族镜像结构）
+// project 族（§4.3：register/update/archive/unarchive/list，与 column 族镜像结构）
 // ─────────────────────────────────────────────────────────────────────────────
 
 // runProjectRegister `aiteam project register --code <c> [--name <n>] [--heartbeat-timeout <sec>]`
@@ -210,6 +211,41 @@ func runProjectArchive(ctx context.Context, args []string, serverOverride string
 		return fail(err)
 	}
 	fmt.Fprintln(os.Stdout, "OK archived")
+	return 0
+}
+
+// runProjectUnarchive `aiteam project unarchive --code <c>` +身份（§4.3 反归档，
+// M-31 archive 逆动词）。输出 `OK unarchived`。
+func runProjectUnarchive(ctx context.Context, args []string, serverOverride string) int {
+	fs := newFlagSet("aiteam project unarchive",
+		"用法: aiteam project unarchive --code <项目code> "+identityUsage)
+	var id identityFlags
+	var code string
+	registerCommonFlags(fs, &id)
+	fs.StringVar(&code, "code", "", "待反归档项目 code（必填）")
+	if proceed, exit := parseFlags(fs, args); !proceed {
+		return exit
+	}
+	if err := requireCode(code); err != nil {
+		return fail(err)
+	}
+	ident, err := validateIdentity(id)
+	if err != nil {
+		return fail(err)
+	}
+	c, err := buildClient(id, ident, serverOverride)
+	if err != nil {
+		return fail(err)
+	}
+	// 动作子资源端点（POST …/projects/{code}/unarchive）；响应字段面复用
+	// archiveResp（服务端 unarchive 恒 {status:"active"}，与 archive 同构仅取
+	// status 单字段，CLI 输出不做二次解析）。
+	var resp archiveResp
+	err = c.Do(ctx, http.MethodPost, "/api/v1/projects/"+url.PathEscape(strings.TrimSpace(code))+"/unarchive", nil, &resp)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Fprintln(os.Stdout, "OK unarchived")
 	return 0
 }
 
@@ -360,6 +396,40 @@ func runColumnArchive(ctx context.Context, args []string, serverOverride string)
 		return fail(err)
 	}
 	fmt.Fprintln(os.Stdout, "OK archived")
+	return 0
+}
+
+// runColumnUnarchive `aiteam column unarchive --project <P> --code <c>` +身份
+// （§4.3 反归档，M-31 archive 逆动词）。输出 `OK unarchived`。
+func runColumnUnarchive(ctx context.Context, args []string, serverOverride string) int {
+	fs := newFlagSet("aiteam column unarchive",
+		"用法: aiteam column unarchive --project <父项目code> --code <栏目code> "+identityUsage)
+	var id identityFlags
+	var code string
+	registerCommonFlags(fs, &id)
+	fs.StringVar(&code, "code", "", "待反归档栏目 code（必填）")
+	if proceed, exit := parseFlags(fs, args); !proceed {
+		return exit
+	}
+	if err := requireCode(code); err != nil {
+		return fail(err)
+	}
+	ident, err := validateIdentity(id)
+	if err != nil {
+		return fail(err)
+	}
+	c, err := buildClient(id, ident, serverOverride)
+	if err != nil {
+		return fail(err)
+	}
+	// 动作子资源端点（POST …/columns/{col}/unarchive）借 columnPath 拼 PathEscape
+	// 同款；响应字段面复用 archiveResp（恰 {status:"active"}，同 project 族）。
+	var resp archiveResp
+	err = c.Do(ctx, http.MethodPost, columnPath(ident.Project, code)+"/unarchive", nil, &resp)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Fprintln(os.Stdout, "OK unarchived")
 	return 0
 }
 

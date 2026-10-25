@@ -294,6 +294,79 @@ func TestArchiveProjectEndpoint(t *testing.T) {
 	}
 }
 
+// ---- M-31 POST /api/v1/projects/{code}/unarchive ----
+
+// TestUnarchiveProjectEndpoint 反归档端点（M-31，#3 逆动词，AC2①~⑤）：软删恢复
+// status→active，响应恰 {status:"active"}；project.unarchive 审计留痕；幂等重放
+// 仍 200 照常留痕；目标不存在 404 project_not_found 不留痕。
+func TestUnarchiveProjectEndpoint(t *testing.T) {
+	h, st := seedDomain(t)
+	const t0 = "2026-01-01T08:00:00Z"
+	injectFixedClock(t, t0)
+	if _, err := st.CreateProject(store.Project{Code: "p-b", Name: "项目B"}); err != nil {
+		t.Fatalf("夹具 p-b 失败: %v", err)
+	}
+	if err := st.ArchiveProject("p-b"); err != nil {
+		t.Fatalf("归档夹具 p-b 失败: %v", err)
+	}
+
+	// AC2①：200 且响应恰 {status:"active"}。
+	rr := doAuthedReq(t, h, http.MethodPost, "/api/v1/projects/p-b/unarchive",
+		"", authProj, authCol, authSess, authRole)
+	data := wantData(t, rr, http.StatusOK)
+	if got := data["status"]; got != "active" {
+		t.Errorf("data.status = %v，期望 active", got)
+	}
+	if len(data) != 1 {
+		t.Errorf("data 字段面 = %v，期望恰 {status}（b1-spec §2.2）", data)
+	}
+
+	// 数据面：恢复可见（默认列表 p-a/p-b 均 active）。
+	active, err := st.ListProjects(false)
+	if err != nil || len(active) != 2 {
+		t.Fatalf("反归档后默认列表长度 = %d（err=%v），期望 2（p-b 恢复可见）", len(active), err)
+	}
+
+	// AC2④⑤：带四头走完整心跳链（会话 upsert 侧效应可断言），project.unarchive
+	// 审计留痕，detail 记 status 流转真实前态。
+	entries := queryAuditByAction(t, st, store.AuditProjectUnarchive)
+	if len(entries) != 1 {
+		t.Fatalf("project.unarchive 审计行数 = %d，期望 1", len(entries))
+	}
+	e := entries[0]
+	if e.SessionID != querySingleSession(t, st).ID || e.CreatedAt != t0 {
+		t.Errorf("unarchive 审计身份/时间 = (%d,%q)，期望操作会话+注入时钟 %q", e.SessionID, e.CreatedAt, t0)
+	}
+	detail := decodeAuditDetail(t, e)
+	before, _ := detail["before"].(map[string]any)
+	after, _ := detail["after"].(map[string]any)
+	if before == nil || before["status"] != "archived" || after == nil || after["status"] != "active" {
+		t.Errorf("unarchive detail = %v，期望 before.status=archived/after.status=active", detail)
+	}
+
+	// AC2②：幂等重放仍 200（store CASE 幂等），重放动作照常留痕且 detail 记
+	// 真实前态（重放时 before 已是 active）。
+	rr = doAuthedReq(t, h, http.MethodPost, "/api/v1/projects/p-b/unarchive",
+		"", authProj, authCol, authSess, authRole)
+	wantData(t, rr, http.StatusOK)
+	entries = queryAuditByAction(t, st, store.AuditProjectUnarchive)
+	if len(entries) != 2 {
+		t.Fatalf("重放后 project.unarchive 审计行数 = %d，期望 2（动作发生即留痕）", len(entries))
+	}
+	detail = decodeAuditDetail(t, entries[0])
+	if b, _ := detail["before"].(map[string]any); b == nil || b["status"] != "active" {
+		t.Errorf("重放审计 detail.before = %v，期望 status=active（真实前态）", detail["before"])
+	}
+
+	// AC2③：目标不存在 → project_not_found，不留痕。
+	rr = doAuthedReq(t, h, http.MethodPost, "/api/v1/projects/nope/unarchive",
+		"", authProj, authCol, authSess, authRole)
+	wantErrBody(t, rr, http.StatusNotFound, types.CodeProjectNotFound)
+	if got := len(queryAuditByAction(t, st, store.AuditProjectUnarchive)); got != 2 {
+		t.Errorf("404 后 project.unarchive 审计行数 = %d，期望仍 2（拒绝动作不留痕）", got)
+	}
+}
+
 // ---- #4 GET /api/v1/projects ----
 
 // TestListProjectsEndpoint 端点 #4：默认仅 active，include_archived=true 全含

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"slices"
 	"testing"
 
 	"aiteam/internal/types"
@@ -30,7 +31,10 @@ func positionRow(t *testing.T, s *Store, columnID int64, consumer string) (pos i
 //	项目 p-a / 栏目 01、02；会话 controller@01 / executor-B@01 / executor-C@01。
 //	消息五条（seq 按插入序 1~5 自增，键入映射便于断言）：
 //	  seq1 direct→executor（exe 信箱可见）
-//	  seq2 bus（仅 controller 信箱可见——bus 分支 controller 闸）
+//	  seq2 bus by exe（仅 controller 信箱可见——bus 分支 controller 闸；b2-T1：
+//	       发送方从 ctrl 改 exe——poll 谓词已排除消费方自发 bus，机械对拍门
+//	       （TestAdvanceOmittedMatchesPollPredicate）两侧须逐值相等，夹具不落
+//	       自发回声；sender 身份对本文件各断言零影响——位点读写不依赖发送者）
 //	  seq3 chat→exe（发送方 ctrl——exe 对话可见）
 //	  seq4 chat 自发 by exe（自发不回流，任何消费上下文不可见）
 //	  seq5 chat→exe2（发送方 ctrl——exe2 对话可见）
@@ -58,7 +62,7 @@ func seedPositionsFixture(t *testing.T, s *Store) (pid, c1, ctrl, exe, exe2 int6
 	put("bus", seedMessageFull(t, s, MessageInput{
 		ProjectID: pid, ColumnID: c1,
 		Kind:            MessageKindBus,
-		SenderSessionID: ctrl, SenderLabel: "controller@01",
+		SenderSessionID: exe, SenderLabel: "executor-B@01",
 		Level: MessageLevelNormal, Body: "总线广播",
 	}, t0))
 	put("chat_to_exe", seedMessageFull(t, s, MessageInput{
@@ -382,4 +386,65 @@ func TestAdvanceOmittedMatchesPollPredicate(t *testing.T) {
 		t.Fatalf("插入对拍追加消息失败: %v", err)
 	}
 	assertAckMatchesPoll(t, s, pid, c1, "executor", exe)
+}
+
+// TestAdvanceOmittedSwallowsSelfBusOnly b2-T1 合规审建议守门：省略 ack 侧
+// （maxVisibleMailbox，位点机制红线冻结面）bus 分支不排除发送方——省略 ack 的
+// 信箱位点会「越位」跨过自发 bus 的 seq（poll 谓词 b2-R2 起不投递自发回声，
+// 该 seq 从未对 poll 可见）。本测把 messages.go 登记的「口径分歧无害」从注释
+// 论证升级为机械守门，两面锁定：
+//
+//	①分歧存在性：省略 ack 返回的信箱位点=自发 bus 的 seq（自发 bus 垫尾时越过
+//	  poll 可见最大 seq——两端口径分歧实拍；若将来两侧对齐改排除，本断言红，
+//	  届时随改动同步更新即可）；
+//	②无害性：越位后同会话再 poll，ack 后新到的可见消息（direct/他人 bus）
+//	  零丢失逐条到场；新发自发 bus 仍被 poll 谓词排除——越位只吞自发 bus、
+//	  不吞任何（现在或将来）poll 可见消息（seq 单调递增，新消息恒 > 位点）。
+func TestAdvanceOmittedSwallowsSelfBusOnly(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-10-02T08:00:00Z"
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, t0)
+	c1 := seedColumn(t, s, pid, "01", "栏目01", ColumnStatusActive, t0)
+	ctrl := seedSession(t, s, pid, c1, "controller", "controller", t0, t0)
+	other := seedSession(t, s, pid, c1, "executor-A", "executor", t0, t0)
+
+	// seq 递增：d1(direct→controller，可见) bOther(他人 bus，可见) bSelf(ctrl
+	// 自发 bus——poll 不可见、省略 ack 侧计入)。bSelf 刻意垫尾=全场最大：越位
+	// 窗口 (bOther, bSelf] 内除自发 bus 外空无一物，是「越位会不会吞可见消息」
+	// 的最严苛观察位。
+	d1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindDirect, TargetRole: "controller", SenderSessionID: other, SenderLabel: "executor-A@01", Level: "normal", Body: "d1"}, t0)
+	bOther := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: other, SenderLabel: "executor-A@01", Level: "normal", Body: "bus-other"}, t0)
+	bSelf := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: ctrl, SenderLabel: "controller@01", Level: "normal", Body: "bus-self"}, t0)
+
+	// 前置态：位点 0 poll 可见集=[d1, bOther]——自发 bSelf 不在其中（b2-R2 排除）。
+	got, err := s.PollVisible(pid, c1, "controller", ctrl, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("PollVisible(省略 ack 前) 失败: %v", err)
+	}
+	if want := []int64{d1, bOther}; !slices.Equal(seqs(got), want) {
+		t.Fatalf("ack 前 poll = %v，期望 %v（自发 bus 不投递前置态）", seqs(got), want)
+	}
+
+	// 省略 ack：信箱位点=当前最大可见（ack 侧口径=direct+全部 bus 含自发）→
+	// bSelf——①越过 poll 可见最大 bOther 的分歧存在性锁定。
+	pos, err := s.AdvancePositions(pid, c1, "controller", ctrl, 0)
+	if err != nil {
+		t.Fatalf("省略 AdvancePositions 失败: %v", err)
+	}
+	if pos.Mailbox != bSelf {
+		t.Errorf("省略 ack 信箱位点 = %d，期望 %d（ack 侧 bus 分支不排除发送方——越位跨过 poll 可见最大 %d）", pos.Mailbox, bSelf, bOther)
+	}
+
+	// ②无害性：越位后同会话再种三条（可见 direct/可见他人 bus/新自发 bus），
+	// 以 ack 后位点 poll——可见两条零丢失逐条到场，新自发 bus 仍排除。
+	d2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindDirect, TargetRole: "controller", SenderSessionID: other, SenderLabel: "executor-A@01", Level: "normal", Body: "d2"}, t0)
+	bOther2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: other, SenderLabel: "executor-A@01", Level: "normal", Body: "bus-other-2"}, t0)
+	seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: ctrl, SenderLabel: "controller@01", Level: "normal", Body: "bus-self-2"}, t0)
+	got, err = s.PollVisible(pid, c1, "controller", ctrl, pos.Mailbox, pos.Dialog, 0)
+	if err != nil {
+		t.Fatalf("PollVisible(省略 ack 后) 失败: %v", err)
+	}
+	if want := []int64{d2, bOther2}; !slices.Equal(seqs(got), want) {
+		t.Errorf("ack 后 poll = %v，期望 %v（越位只吞自发 bus，可见消息零丢失；新自发 bus 仍排除）", seqs(got), want)
+	}
 }

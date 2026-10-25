@@ -726,3 +726,148 @@ func TestArchiveColumnWithAudit(t *testing.T) {
 		t.Errorf("audit_log 行数 = %d，期望 2（register+archive 各一，回滚不计）", n)
 	}
 }
+
+// ---- UnarchiveColumn / UnarchiveColumnWithAudit（M-31：镜像 archive 对称纯新增） ----
+
+// TestUnarchiveColumn AC1 同型（M-31）：archived→active 刷 updated_at；重复
+// unarchive 幂等成功且不刷 updated_at；栏目/项目不存在均归并 ErrColumnNotFound
+// （定位子查询口径镜像 columnArchiveSQL）。
+func TestUnarchiveColumn(t *testing.T) {
+	s := openTemp(t)
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, "2026-01-01T00:00:00Z")
+	seedColumn(t, s, pid, "05", "栏目05", ColumnStatusArchived, "2026-01-01T00:00:00Z")
+	seedColumn(t, s, pid, "act0", "本就活跃", ColumnStatusActive, "2026-01-01T00:01:00Z")
+
+	// 首次 unarchive：status 流转 + updated_at 刷新、created_at 不变。
+	const t1 = "2026-01-02T08:00:00Z"
+	injectFixedClock(t, t1)
+	if err := s.UnarchiveColumn("p-a", "05"); err != nil {
+		t.Fatalf("UnarchiveColumn(p-a, 05) 失败: %v", err)
+	}
+	got, err := s.GetColumnByCode("p-a", "05")
+	if err != nil {
+		t.Fatalf("unarchive 后读取失败: %v", err)
+	}
+	if got.Status != ColumnStatusActive {
+		t.Errorf("status = %q，期望 %q", got.Status, ColumnStatusActive)
+	}
+	if got.ProjectID != pid {
+		t.Errorf("project_id = %d，期望夹具项目 id %d", got.ProjectID, pid)
+	}
+	if got.CreatedAt != "2026-01-01T00:00:00Z" || got.UpdatedAt != t1 {
+		t.Errorf("created_at/updated_at = %q/%q，期望 created 不变 + updated 刷新为 %q", got.CreatedAt, got.UpdatedAt, t1)
+	}
+
+	// 重复 unarchive：幂等成功，且 updated_at 不刷新（换新时钟证明无副作用）。
+	const t2 = "2026-01-03T08:00:00Z"
+	injectFixedClock(t, t2)
+	if err := s.UnarchiveColumn("p-a", "05"); err != nil {
+		t.Fatalf("重复 UnarchiveColumn 应幂等成功，实际: %v", err)
+	}
+	got, err = s.GetColumnByCode("p-a", "05")
+	if err != nil {
+		t.Fatalf("重复 unarchive 后读取失败: %v", err)
+	}
+	if got.UpdatedAt != t1 {
+		t.Errorf("重复 unarchive 不应刷 updated_at：= %q，期望保持 %q", got.UpdatedAt, t1)
+	}
+
+	// 对本就 active 的夹具行 unarchive：同样幂等成功。
+	if err := s.UnarchiveColumn("p-a", "act0"); err != nil {
+		t.Fatalf("对 active 行 UnarchiveColumn 应幂等成功，实际: %v", err)
+	}
+
+	// 栏目不存在 → ErrColumnNotFound。
+	if err := s.UnarchiveColumn("p-a", "nope"); !errors.Is(err, ErrColumnNotFound) {
+		t.Errorf("unarchive 不存在栏目错误 = %v，期望哨兵 ErrColumnNotFound", err)
+	}
+
+	// 项目不存在 → 归并 ErrColumnNotFound。
+	if err := s.UnarchiveColumn("nope", "05"); !errors.Is(err, ErrColumnNotFound) {
+		t.Errorf("unarchive 不存在项目的栏目错误 = %v，期望哨兵 ErrColumnNotFound", err)
+	}
+}
+
+// TestUnarchiveColumnWithAudit AC1 同型（M-31，镜像 TestArchiveColumnWithAudit）：
+// 栏目反归档+审计同事务——真实前态入快照、幂等重放照常留痕且 before=active、
+// 位点不受反归档影响（保留）、栏目/项目不存在归并 404 无审计、action 空回滚
+// status 不变。
+func TestUnarchiveColumnWithAudit(t *testing.T) {
+	s := openTemp(t)
+	injectFixedClock(t, "2026-01-01T08:00:00Z")
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, "2026-01-01T00:00:00Z")
+	// 经 WithAudit 登记产生位点（登记后归档再反归档，断言位点全程保留）。
+	if _, _, err := s.CreateColumnWithAudit("p-a", Column{Code: "05", Name: "栏目05"},
+		AuditEntry{Action: AuditColumnRegister, Detail: "{}"}); err != nil {
+		t.Fatalf("登记夹具失败: %v", err)
+	}
+	if err := s.ArchiveColumn("p-a", "05"); err != nil {
+		t.Fatalf("归档夹具失败: %v", err)
+	}
+
+	detailFn := func(before Column) string {
+		return `{"was":"` + before.Status + `"}`
+	}
+	// 反归档：status 流转 + 审计落库（action/弱关联/真实前态快照）。
+	e, err := s.UnarchiveColumnWithAudit("p-a", "05",
+		AuditEntry{Action: AuditColumnUnarchive, SessionID: 2}, detailFn)
+	if err != nil {
+		t.Fatalf("UnarchiveColumnWithAudit 失败: %v", err)
+	}
+	if e.ID <= 0 || e.Detail != `{"was":"archived"}` {
+		t.Errorf("审计 = %+v，期望 id>0 且 detail 记真实前态 archived", e)
+	}
+	if e.Action != AuditColumnUnarchive || e.SessionID != 2 {
+		t.Errorf("审计 action/session_id = %q/%d，期望原样落库 %q/2", e.Action, e.SessionID, AuditColumnUnarchive)
+	}
+	c, err := s.GetColumnByCode("p-a", "05")
+	if err != nil {
+		t.Fatalf("反归档后读取失败: %v", err)
+	}
+	if c.Status != ColumnStatusActive {
+		t.Fatalf("反归档后 status = %q，期望 %q", c.Status, ColumnStatusActive)
+	}
+	if e.ProjectID != pid || e.ColumnID != c.ID {
+		t.Errorf("审计弱关联 = (%d,%d)，期望回填 (%d,%d)", e.ProjectID, e.ColumnID, pid, c.ID)
+	}
+	if n := countRows(t, s, "ack_positions"); n != 2 {
+		t.Errorf("反归档后位点行数 = %d，期望 2（位点保留且不重置，镜像 archive 保留语义）", n)
+	}
+
+	// 幂等重放：before.Status=active 诚实入快照，审计照落。
+	e2, err := s.UnarchiveColumnWithAudit("p-a", "05",
+		AuditEntry{Action: AuditColumnUnarchive}, detailFn)
+	if err != nil {
+		t.Fatalf("幂等重放失败: %v", err)
+	}
+	if e2.Detail != `{"was":"active"}` {
+		t.Errorf("重放审计 detail = %q，期望 {\"was\":\"active\"}（真实前态）", e2.Detail)
+	}
+	if n := countRows(t, s, "audit_log"); n != 3 {
+		t.Errorf("audit_log 行数 = %d，期望 3（register+unarchive+重放各一）", n)
+	}
+
+	// 目标不存在 → ErrColumnNotFound，无审计（栏目/项目两路归并）。
+	for _, tc := range [][2]string{{"p-a", "99"}, {"nope", "05"}} {
+		if _, err := s.UnarchiveColumnWithAudit(tc[0], tc[1],
+			AuditEntry{Action: AuditColumnUnarchive}, detailFn); !errors.Is(err, ErrColumnNotFound) {
+			t.Errorf("目标 %s/%s 错误 = %v，期望 ErrColumnNotFound", tc[0], tc[1], err)
+		}
+	}
+	if n := countRows(t, s, "audit_log"); n != 3 {
+		t.Errorf("404 后 audit_log 行数 = %d，期望仍 3", n)
+	}
+
+	// 原子性：action 空 → 回滚 status 不变（另一 archived 栏目验证）。
+	seedColumn(t, s, pid, "06", "栏目06", ColumnStatusArchived, "2026-01-01T00:01:00Z")
+	if _, err := s.UnarchiveColumnWithAudit("p-a", "06",
+		AuditEntry{Action: " "}, detailFn); !errors.Is(err, ErrAuditInvalid) {
+		t.Fatalf("action 空 → 错误 = %v，期望 ErrAuditInvalid", err)
+	}
+	if c, err := s.GetColumnByCode("p-a", "06"); err != nil || c.Status != ColumnStatusArchived {
+		t.Errorf("回滚后 06 status = %v（err=%v），期望保持 archived", c, err)
+	}
+	if n := countRows(t, s, "audit_log"); n != 3 {
+		t.Errorf("回滚后 audit_log 行数 = %d，期望仍 3", n)
+	}
+}

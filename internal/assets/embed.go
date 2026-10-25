@@ -12,7 +12,7 @@ import "embed"
 //go:embed web
 var WebFS embed.FS
 
-// SkillsFS 技能包：13 个技能目录+LICENSES.md（SKILL.md 等）。init 默认整包
+// SkillsFS 技能包：15 个技能目录+LICENSES.md（SKILL.md 等）。init 默认整包
 // 释放到用户项目 .agents/skills/（merge 语义：同名保留用户版仅新增缺失）。
 // 子树内无 ./_ 前缀文件（embed 会静默排除）。
 

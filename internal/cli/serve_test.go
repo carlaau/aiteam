@@ -45,11 +45,14 @@ func TestMain(m *testing.M) {
 
 // wantServeTables §3.2 十一表清单（与 internal/store/store_test.go 同源；
 // cli 全链测试不 import store 内部测试变量，此处独立断言「11 表齐」）。
-// 第 11 表 progress_reports 系 d722b93 全局变更窗（FR23 进度上报）增补。
+// 第 11 表 progress_reports 系 d722b93 全局变更窗（FR23 进度上报）增补；
+// 第 12 表 recalled_messages 系 v0.4-b5 撤回墓碑（M-36，迁移 v4 增补）——
+// 表数锚随迁移追加被迫刷新（b5-T1 报备），精确计数断言强度不变。
 var wantServeTables = []string{
 	"projects", "columns", "sessions", "sentinels", "messages",
 	"message_receipts", "ack_positions", "resources", "stage_windows", "audit_log",
 	"progress_reports",
+	"recalled_messages",
 }
 
 // chdirForTest 切换进程工作目录至 dir，测试结束自动还原。

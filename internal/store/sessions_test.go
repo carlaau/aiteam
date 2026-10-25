@@ -532,3 +532,47 @@ func TestListSessions(t *testing.T) {
 		t.Errorf("项目不存在列表错误 = %v，期望哨兵 ErrProjectNotFound", err)
 	}
 }
+
+// TestListAliveSessionNamesLastSeen b2-T2/R4（M-35②）last_seen 扩展（结构体化
+// 择型留痕）：活会话按 s.id 稳定序返回四字段——Name/LastSeenAt 原文/ElapsedSec
+// （判活谓词同款 strftime 秒差）/TimeoutSec（项目级有效阈值 COALESCE 值——夹具
+// hb=600 覆盖默认 900，证 eta 数据源取项目级而非服务默认）。既有过滤面零回归：
+// 失联（>600）、异角色、异栏目行照旧不入围；空格子非 nil 空切片。
+func TestListAliveSessionNamesLastSeen(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-01-01T08:00:00Z"
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 600, "2026-01-01T00:00:00Z")
+	cid := seedColumn(t, s, pid, "05", "栏目05", ColumnStatusActive, "2026-01-01T00:00:00Z")
+	seedSession(t, s, pid, cid, "executor-A", "executor", isoTime(t0, -100), "2026-01-01T00:00:00Z")
+	seedSession(t, s, pid, cid, "executor-B", "executor", isoTime(t0, -300), "2026-01-01T00:00:00Z")
+	seedSession(t, s, pid, cid, "executor-stale", "executor", isoTime(t0, -1200), "2026-01-01T00:00:00Z") // >600 失联
+	seedSession(t, s, pid, cid, "controller-C", "controller", isoTime(t0, -50), "2026-01-01T00:00:00Z")   // 异角色
+	otherCol := seedColumn(t, s, pid, "06", "栏目06", ColumnStatusActive, "2026-01-01T00:00:00Z")
+	seedSession(t, s, pid, otherCol, "executor-D", "executor", isoTime(t0, -50), "2026-01-01T00:00:00Z") // 异栏目
+
+	got, err := s.ListAliveSessionNames(pid, cid, "executor", t0, 900)
+	if err != nil {
+		t.Fatalf("ListAliveSessionNames 失败: %v", err)
+	}
+	want := []AliveSession{
+		{Name: "executor-A", LastSeenAt: isoTime(t0, -100), ElapsedSec: 100, TimeoutSec: 600},
+		{Name: "executor-B", LastSeenAt: isoTime(t0, -300), ElapsedSec: 300, TimeoutSec: 600},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("活会话 = %+v，期望 %+v（失联/异角色/异栏目不入围）", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("活会话[%d] = %+v，期望 %+v", i, got[i], w)
+		}
+	}
+
+	// 空格子：非 nil 空切片（ListSessions 惯例）。
+	empty, err := s.ListAliveSessionNames(pid, cid, "watcher", t0, 900)
+	if err != nil {
+		t.Fatalf("空格子查询失败: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Errorf("空格子返回 = %#v，期望非 nil 空切片", empty)
+	}
+}

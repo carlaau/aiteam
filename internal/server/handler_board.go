@@ -160,6 +160,10 @@ type dialogMessageRow struct {
 	// progress 行独有可选键（b5-W3）：指针+omitempty——消息行 nil 键不出现
 	// （六键冻结面零漂移）；progress 行恒非 nil 四键齐全。
 	Progress *dialogProgressDetail `json:"progress,omitempty"`
+	// b5-T4 additive 扩档：墓碑行 recalled:true（body 已在 store SQL 层剥空，
+	// 前端据此渲占位行）；非墓碑行键缺省（omitempty，六键冻结面零漂移——
+	// TestBoardDialogTimelineKeys 既有断言不受涉）。
+	Recalled bool `json:"recalled,omitempty"`
 }
 
 // dialogProgressDetail progress 行装配明细（b5-W3，spec §2.2 契约扩档）：
@@ -244,10 +248,11 @@ func (s *Server) handleBoardDialog(w http.ResponseWriter, r *http.Request) {
 		}
 		row := dialogMessageRow{
 			Seq:       msg.Seq,
-			Body:      msg.Body,
+			Body:      msg.Body, // 墓碑行已在 store SQL 层剥空（b5-T4 硬闸），此处透传
 			Kind:      msg.Kind,
 			From:      from,
 			CreatedAt: msg.CreatedAt,
+			Recalled:  msg.Recalled, // b5-T4：progress 路 SQL 恒 0，合成行键天然缺省
 		}
 		// from_board 装配：board 发=sender_session_id=0（b3-W2 冻结式），
 		// progress 行显式排除恒 false——progress 非「看板侧发出」（b5-W2 SQL
@@ -275,13 +280,17 @@ func (s *Server) handleBoardDialog(w http.ResponseWriter, r *http.Request) {
 
 // ---- #26 GET /api/v1/board/bus-stream（总线流薄壳） ----
 
-// busMessageRow #26 单条（§2.2 #26 五字段；body_preview 截断 B5-T3）。
+// busMessageRow #26 单条（§2.2 #26 五字段；body_preview 截断 B5-T3）。b5-T4
+// additive 扩档：Recalled omitempty——bus v1 不可撤（R1.2 排除面，墓碑不可达）
+// 键恒缺省五键面零漂移；扩档是统一读面（QueryHistory 同源）的契约兜底，防未来
+// bus 开放撤回时漏改此端点。
 type busMessageRow struct {
 	Seq         int64  `json:"seq"`
 	Level       string `json:"level"`
 	Sender      string `json:"sender"` // sender_label 冗余显示直出（AC8.4 发送方要素）
 	CreatedAt   string `json:"created_at"`
 	BodyPreview string `json:"body_preview"`
+	Recalled    bool   `json:"recalled,omitempty"`
 }
 
 // boardBusStreamData #26 响应 data。
@@ -316,7 +325,8 @@ func (s *Server) handleBoardBusStream(w http.ResponseWriter, r *http.Request) {
 			Level:       msg.Level,
 			Sender:      msg.SenderLabel,
 			CreatedAt:   msg.CreatedAt,
-			BodyPreview: truncateBoardPreview(msg.Body),
+			BodyPreview: truncateBoardPreview(msg.Body), // 墓碑行 body 已 SQL 层剥空→preview 恒空串
+			Recalled:    msg.Recalled,
 		})
 	}
 	types.WriteData(w, http.StatusOK, boardBusStreamData{Messages: rows})

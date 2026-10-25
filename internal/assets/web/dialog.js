@@ -309,6 +309,22 @@ function buildProgressRow(p) {
 // （direct 同构灰态兜底）。chip 仅 from_board===true 行挂（board 发恒 chat，判据
 // 按 AC 字面量独立于 kind 分支）。
 function buildMessageRow(m, dialogPos) {
+  const seq = m.seq;
+  // b5-T4 墓碑行（recalled=true，服务端已剥 body——wire body 恒空串）：占位行
+  // 替代正文，不渲染 body、不挂折叠钮（占位文本恒短）与两态 chip（撤回件=未消费
+  // 即撤，「已投递/已处理」语义不适用）；meta 行保留（seq/时刻/from 可追溯，观测
+  // 面）。行类统一 kind-other 灰态（占位与来源 kind 无关）+ .recalled-placeholder
+  // 灰化斜体（亮暗两主题既有变量级联，style.css）。
+  if (m.recalled === true) {
+    const row = el('div', 'msg-row kind-other');
+    const fromVal = txt(m.from);
+    row.append(
+      el('div', 'msg-body recalled-placeholder', '消息已由发送方撤回'),
+      el('div', 'msg-details', '#' + txt(seq) + ' · ' + fmtTime(m.created_at) +
+        ' · from: ' + (fromVal === '-' ? '看板' : (fromVal === '' ? '—' : fromVal))),
+    );
+    return row;
+  }
   const kind = txt(m.kind);
   const mine = m.from_board === true;
   let rowCls;
@@ -316,7 +332,7 @@ function buildMessageRow(m, dialogPos) {
   else if (kind === 'chat' || kind === '') rowCls = mine ? 'from-board' : 'from-agent';
   else rowCls = 'kind-other';
   const row = el('div', 'msg-row ' + rowCls);
-  const seq = m.seq;
+  // seq 已在函数顶声明（b5-T4 墓碑早退分支共用）
 
   // 正文（chat=气泡/direct=CLI 行同用 .msg-body，形态差异全在 CSS 类面）+
   // 超长折叠：byteLen>2KB 默认收起（.msg-folded），「展开全文/收回」切换

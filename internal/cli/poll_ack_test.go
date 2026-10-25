@@ -8,8 +8,15 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"aiteam/internal/config"
+	"aiteam/internal/server"
+	"aiteam/internal/store"
 )
 
 // poll/ack/history 三命令 CLI 测试（B2-7，in-process 端到端）：真 store + 真
@@ -48,9 +55,12 @@ func TestPollOutput(t *testing.T) {
 	// 种两条：direct（block 级多行正文，发往本格子）+ bus（important）。
 	// 引导栏目 seed 时位点预置 0（InitColumnPositions，当时 MAX(seq)=0）且未
 	// ack，故 poll 响应双位点均为 0——期望串据此逐字拼装。
+	// b2-T1（M-33）口径更新：本会话身份=controller，bus 为自发——poll 谓词已
+	// 排除发送方自发 bus（不回投自己信箱），poll 只拉到 direct 一条；bus 发送
+	// 保留在场（自发回声场景断言按新语义更新，spec/plan 声明的豁免面）。
 	seq1, ts1 := sendOK(t, addr, root, "--to-role", regAuthRole, "--level", "block",
 		"--body", "第一行\n第二行")
-	seq2, ts2 := sendOK(t, addr, root, "--bus", "--level", "important", "--body", "bus 正文")
+	seq2, _ := sendOK(t, addr, root, "--bus", "--level", "important", "--body", "bus 正文")
 
 	stdout, stderr := runWantCode(t, "poll", 0, func() int {
 		return runPoll(ctx, regIdentityArgs(), addr)
@@ -61,11 +71,14 @@ func TestPollOutput(t *testing.T) {
 	label := regAuthSession + "@" + regAuthColumn
 	want := fmt.Sprintf(
 		"[%d] block  %s  %s(direct)\n      第一行\n      第二行\n"+
-			"[%d] important  %s  %s(bus)\n      bus 正文\n"+
-			"# pending=2 mailbox_pos=0 dialog_pos=0\n",
-		seq1, ts1, label, seq2, ts2, label)
+			"# pending=1 mailbox_pos=0 dialog_pos=0\n",
+		seq1, ts1, label)
 	if stdout != want {
 		t.Errorf("poll 输出逐字对拍失败\n得到: %q\n期望: %q", stdout, want)
+	}
+	// 自发 bus 不回投负断言（b2-T1 排除面）：输出不含 bus 行与该 seq。
+	if strings.Contains(stdout, "(bus)") || strings.Contains(stdout, fmt.Sprintf("[%d]", seq2)) {
+		t.Errorf("自发 bus(seq=%d) 不应回投发送方自己信箱:\n%s", seq2, stdout)
 	}
 
 	// --json 与 #10 响应 data 同构：恰三键 + messages 元素恰六键 + 字段值。
@@ -103,8 +116,8 @@ func TestPollOutput(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &parsed); err != nil {
 		t.Fatalf("poll --json 解析失败: %v", err)
 	}
-	if len(parsed.Messages) != 2 {
-		t.Fatalf("poll --json messages 应 2 条，实际 %d", len(parsed.Messages))
+	if len(parsed.Messages) != 1 {
+		t.Fatalf("poll --json messages 应 1 条（自发 bus 不回投，b2-T1），实际 %d", len(parsed.Messages))
 	}
 	m0 := parsed.Messages[0]
 	if m0.Seq != seq1 || m0.Kind != "direct" || m0.Level != "block" || m0.Body != "第一行\n第二行" ||
@@ -482,6 +495,290 @@ func TestHistoryLimitZeroPassthrough(t *testing.T) {
 	})
 	if q := <-queryCh; q.Get("limit") != "25" {
 		t.Errorf("--limit 25 应透传 limit=25，实际 query=%v", q)
+	}
+}
+
+// ---- b2-T3 poll --ack 一键消费（b2-spec §二.R1/AC1，M-32）----
+//
+// R1 口径四形态：①拉到信箱消息即推进到本次最大信箱 seq（再 poll 零重复）
+// ②空信箱零动作零输出差异（与不带 --ack 逐字节一致，文本/--json 两形态）
+// ③--json 尾注 acked_to（拉到=推进落定位点数值；空箱=键缺省——省略口径）
+// ④不带 --ack 默认只读回归锚=既有 TestPollOutput/TestPollIdempotentReread
+// （零改动零复述）。推进目标只取信箱域（direct/bus）最大 seq——chat/receipt
+// 归对话流不纳入（ack --seq 语义推的就是信箱位点，§3.6 谓词三分支）。
+
+// TestPollAckAdvance AC1① 主链：send direct×2 → poll --ack 展示照常（输出与
+// 只读 poll 同形零增行——文本形态纯副作用）→ 再 poll 零重复（空箱+双位点推进
+// 到最大 seq）。尾段 bus 补面：另一 controller 会话拉到 bus（T1 排除只对发送
+// 方本人）同样纳入推进目标。
+func TestPollAckAdvance(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+
+	seq1, ts1 := sendOK(t, addr, root, "--to-role", regAuthRole, "--body", "甲")
+	seq2, ts2 := sendOK(t, addr, root, "--to-role", regAuthRole, "--body", "乙")
+
+	stdout, stderr := runWantCode(t, "poll --ack", 0, func() int {
+		return runPoll(ctx, append(regIdentityArgs(), "--ack"), addr)
+	})
+	if stderr != "" {
+		t.Errorf("poll --ack 成功不应有 stderr 输出，实际 %q", stderr)
+	}
+	// 展示照常且零增行：与不带 --ack 的只读输出同形（GET 时点双位点 0）——
+	// --ack 在文本形态是纯副作用，推进结果只经后续位点与 --json acked_to 呈现。
+	label := regAuthSession + "@" + regAuthColumn
+	want := fmt.Sprintf(
+		"[%d] normal  %s  %s(direct)\n      甲\n"+
+			"[%d] normal  %s  %s(direct)\n      乙\n"+
+			"# pending=2 mailbox_pos=0 dialog_pos=0\n",
+		seq1, ts1, label, seq2, ts2, label)
+	if stdout != want {
+		t.Errorf("poll --ack 文本输出应与只读 poll 同形（零增行）\n得到: %q\n期望: %q", stdout, want)
+	}
+
+	// AC1① 双断言链后半：再 poll 零重复——空箱+双位点=seq2（#11 显式 seq 双
+	// 维度同推到该值，既有语义）。
+	stdout, _ = runWantCode(t, "ack 后再 poll", 0, func() int {
+		return runPoll(ctx, regIdentityArgs(), addr)
+	})
+	if want := fmt.Sprintf("# pending=0 mailbox_pos=%d dialog_pos=%d\n", seq2, seq2); stdout != want {
+		t.Errorf("poll --ack 后再 poll = %q，期望零重复且双位点=%d（AC1①）", stdout, seq2)
+	}
+
+	// bus 同属信箱域：另一 controller 会话 poll --ack 拉到 bus（自发回声排除
+	// 只挡发送方本人，他人广播照投）即推进到位点=bus seq。
+	seqBus, _ := sendOK(t, addr, root, "--bus", "--body", "总线消息")
+	watcher := identityArgsAs("controller-B", "controller")
+	stdout, _ = runWantCode(t, "controller-B poll --ack bus", 0, func() int {
+		return runPoll(ctx, append(watcher, "--ack"), addr)
+	})
+	if !strings.Contains(stdout, fmt.Sprintf("[%d]", seqBus)) || !strings.Contains(stdout, "(bus)") {
+		t.Errorf("controller-B poll --ack 应展示 bus 消息:\n%s", stdout)
+	}
+	stdout, _ = runWantCode(t, "bus 推进后再 poll", 0, func() int {
+		return runPoll(ctx, watcher, addr)
+	})
+	if want := fmt.Sprintf("# pending=0 mailbox_pos=%d dialog_pos=%d\n", seqBus, seqBus); stdout != want {
+		t.Errorf("bus --ack 后再 poll = %q，期望零重复且双位点=%d", stdout, seqBus)
+	}
+}
+
+// TestPollAckMailboxDomainOnly 口径守门：①信箱空（仅 chat 在场）--ack 零动作
+// ——与只读 poll 输出逐字节一致；②chat seq 高于信箱最大时只推到信箱最大，
+// chat 保持未消费（若实现误取全消息最大 seq 将连 chat 一并吞掉，此处即红）。
+func TestPollAckMailboxDomainOnly(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	executor := identityArgsAs("executor-B", "executor")
+
+	// 目标会话预注册（TestChatRoundtrip 同款手法：--to-session 要求会话已在，
+	// 以 executor-B 身份 GET #13 upsert，先于任何 chat 种消息）。
+	historyProbe(t, addr, "executor-B", "executor", "")
+
+	// ① 仅 chat（信箱空）：--ack 零动作——两次均只读 GET 状态不变，输出应逐
+	// 字节一致（stdout+stderr），chat 保持可见。
+	chat1, _ := sendOK(t, addr, root, "--to-session", "executor-B", "--body", "仅对话")
+	plain, plainErr := runWantCode(t, "仅 chat 只读 poll", 0, func() int {
+		return runPoll(ctx, executor, addr)
+	})
+	acked, ackedErr := runWantCode(t, "仅 chat poll --ack", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack"), addr)
+	})
+	if plain != acked || plainErr != ackedErr {
+		t.Errorf("空信箱（仅 chat）--ack 与不带 --ack 输出应逐字节一致（AC1②）\n"+
+			"stdout: %q vs %q\nstderr: %q vs %q", plain, acked, plainErr, ackedErr)
+	}
+	if !strings.Contains(acked, fmt.Sprintf("[%d] normal", chat1)) {
+		t.Errorf("仅 chat 场景 chat 应保持可见（零动作证据）:\n%s", acked)
+	}
+
+	// ② chat 高于信箱最大：direct×2 + chat（seq 最高）→ poll --ack 只推到
+	// direct 最大 seq——再 poll 仍拉到该 chat（对话位点=信箱最大，chat 越位未消费）。
+	sendOK(t, addr, root, "--to-role", "executor", "--body", "信箱甲")
+	seqB, _ := sendOK(t, addr, root, "--to-role", "executor", "--body", "信箱乙")
+	chatHi, tsHi := sendOK(t, addr, root, "--to-session", "executor-B", "--body", "高于信箱的对话")
+	runWantCode(t, "混合 poll --ack", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack"), addr)
+	})
+	stdout, _ := runWantCode(t, "推进后再 poll", 0, func() int {
+		return runPoll(ctx, executor, addr)
+	})
+	want := fmt.Sprintf("[%d] normal  %s  %s(chat)\n      高于信箱的对话\n"+
+		"# pending=1 mailbox_pos=%d dialog_pos=%d\n",
+		chatHi, tsHi, regAuthSession+"@"+regAuthColumn, seqB, seqB)
+	if stdout != want {
+		t.Errorf("chat 高于信箱最大时应只推到信箱最大（chat 保持可见）\n得到: %q\n期望: %q", stdout, want)
+	}
+}
+
+// TestPollAckJSON AC1③ --json 尾注：拉到=恰四键（pollData 三键+acked_to=推进
+// 落定值），前三键保持 GET 时点原值（尾注非改写）；空信箱（刚消费殆尽）--ack
+// --json 与只读 --json 逐字节一致——acked_to 键缺省=省略口径（spec「未拉到为
+// null/省略」二择一取省略：与 cross_grid_hint 的 additive/omitempty 口径一致，
+// 且空箱两形态均逐字节同形）。
+func TestPollAckJSON(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	executor := identityArgsAs("executor-B", "executor")
+
+	seq1, _ := sendOK(t, addr, root, "--to-role", "executor", "--body", "甲")
+	seq2, _ := sendOK(t, addr, root, "--to-role", "executor", "--body", "乙")
+
+	stdout, _ := runWantCode(t, "poll --ack --json", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack", "--json"), addr)
+	})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
+		t.Fatalf("poll --ack --json 非合法 JSON: %v\n%s", err, stdout)
+	}
+	if len(raw) != 4 {
+		t.Errorf("--ack --json 键数 = %d，期望恰四键（pollData 三键+acked_to 尾键）: %v", len(raw), raw)
+	}
+	if got := strings.TrimSpace(string(raw["acked_to"])); got != strconv.FormatInt(seq2, 10) {
+		t.Errorf("acked_to = %s，期望 %d（本次最大信箱 seq=推进落定值）", got, seq2)
+	}
+	// 前三键保持 GET 时点原值（acked_to 是尾注非改写）：双位点=推进前 0/0、
+	// messages=本次拉到的 2 条（seq1/seq2 升序）。
+	var base struct {
+		MailboxPosition int64 `json:"mailbox_position"`
+		DialogPosition  int64 `json:"dialog_position"`
+		Messages        []struct {
+			Seq int64 `json:"seq"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &base); err != nil {
+		t.Fatalf("poll --ack --json 解析失败: %v", err)
+	}
+	if base.MailboxPosition != 0 || base.DialogPosition != 0 ||
+		len(base.Messages) != 2 || base.Messages[0].Seq != seq1 || base.Messages[1].Seq != seq2 {
+		t.Errorf("--ack --json 前三键应保持 GET 时点值（双位点 0/0、messages=[%d %d]），实际 %+v",
+			seq1, seq2, base)
+	}
+
+	// 空信箱（上一段已消费殆尽）：--ack --json 与只读 --json 逐字节一致
+	// （acked_to 键缺省，AC1② 的 --json 形态）。
+	plainJSON, plainJErr := runWantCode(t, "空箱只读 --json", 0, func() int {
+		return runPoll(ctx, append(executor, "--json"), addr)
+	})
+	ackJSON, ackJErr := runWantCode(t, "空箱 --ack --json", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack", "--json"), addr)
+	})
+	if plainJSON != ackJSON || plainJErr != ackJErr {
+		t.Errorf("空信箱 --ack --json 与只读 --json 应逐字节一致\nstdout: %q vs %q\nstderr: %q vs %q",
+			plainJSON, ackJSON, plainJErr, ackJErr)
+	}
+}
+
+// TestPollAckEmptyMailboxIdentity AC1② 真空信箱（零消息）：poll --ack 与不带
+// --ack 输出逐字节一致（文本+--json 两形态、stdout+stderr 双通道）——--ack 纯
+// opt-in，默认只读面（AC1④）的镜像回归（只读侧锚=既有 TestPollOutput/
+// TestPollIdempotentReread，零改动零复述）。
+func TestPollAckEmptyMailboxIdentity(t *testing.T) {
+	addr := startRegTestServer(t)
+	ctx := context.Background()
+	executor := identityArgsAs("executor-B", "executor")
+
+	textPlain, textPlainErr := runWantCode(t, "空箱只读 poll", 0, func() int {
+		return runPoll(ctx, executor, addr)
+	})
+	textAck, textAckErr := runWantCode(t, "空箱 poll --ack", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack"), addr)
+	})
+	if textPlain != textAck || textPlainErr != textAckErr {
+		t.Errorf("空信箱 --ack 与不带 --ack 文本输出应逐字节一致\n"+
+			"stdout: %q vs %q\nstderr: %q vs %q", textPlain, textAck, textPlainErr, textAckErr)
+	}
+
+	jsonPlain, jsonPlainErr := runWantCode(t, "空箱只读 poll --json", 0, func() int {
+		return runPoll(ctx, append(executor, "--json"), addr)
+	})
+	jsonAck, jsonAckErr := runWantCode(t, "空箱 poll --ack --json", 0, func() int {
+		return runPoll(ctx, append(executor, "--ack", "--json"), addr)
+	})
+	if jsonPlain != jsonAck || jsonPlainErr != jsonAckErr {
+		t.Errorf("空信箱 --ack 与不带 --ack --json 输出应逐字节一致\n"+
+			"stdout: %q vs %q\nstderr: %q vs %q", jsonPlain, jsonAck, jsonPlainErr, jsonAckErr)
+	}
+}
+
+// TestPollAckPostFailureInjected 质量审加固（b2-T3 审查建议采纳）：GET #10 成功
+// 但 POST #11 失败 → 非零退出且不展示——poll.go「推进先于渲染、失败零展示」
+// 保证此前仅靠代码顺序阅读核实，此处注入失败直接测试。夹具=真 store+真 server
+// 外包自包装 handler（TestHistoryLimitZeroPassthrough 同款手法+真服务代理）：
+// POST /api/v1/acks 命中开关时注入 500 {error} 包裹（client.APIError → 退 4），
+// 其余请求原样透传真服务——故失败后可直接验真库位点状态与修复重跑恢复面。
+// failAcks 走 atomic（handler 在服务端 goroutine 读、测试 goroutine 写）。
+func TestPollAckPostFailureInjected(t *testing.T) {
+	// 本地装配真服务（seed 引导域同 startRegTestServer 骨架）——夹具需持有
+	// handler 供外层包装注入，故不走 startRegTestServer（其只回地址）。
+	st, err := store.Open(filepath.Join(t.TempDir(), "poll-ack-fail.db"))
+	if err != nil {
+		t.Fatalf("打开临时 store 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if _, err := st.CreateProject(store.Project{Code: regAuthProject, Name: "引导项目"}); err != nil {
+		t.Fatalf("seed 项目失败: %v", err)
+	}
+	if _, _, err := st.CreateColumnWithAudit(regAuthProject, store.Column{Code: regAuthColumn, Name: "引导栏目"},
+		store.AuditEntry{Action: store.AuditColumnRegister, Detail: "{}"}); err != nil {
+		t.Fatalf("seed 栏目失败: %v", err)
+	}
+	real := server.NewServer(st, config.Default(), server.Version)
+	var failAcks atomic.Bool
+	failAcks.Store(true)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failAcks.Load() && r.Method == http.MethodPost && r.URL.Path == "/api/v1/acks" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"注入的 ack 失败"}}`))
+			return
+		}
+		real.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	ctx := context.Background()
+	root := t.TempDir()
+
+	seq1, _ := sendOK(t, ts.URL, root, "--to-role", regAuthRole, "--body", "甲")
+	seq2, _ := sendOK(t, ts.URL, root, "--to-role", regAuthRole, "--body", "乙")
+
+	// poll --ack：GET 成功、ack POST 注入失败 → 退 4（APIError）、stdout 零输出
+	// （不展示）、stderr 含 ERROR 错误行。
+	stdout, stderr := runWantCode(t, "ack 注入失败 poll --ack", 4, func() int {
+		return runPoll(ctx, append(regIdentityArgs(), "--ack"), ts.URL)
+	})
+	if stdout != "" {
+		t.Errorf("ack 失败时不应有任何 stdout 展示（推进先于渲染的失败零展示保证），实际 %q", stdout)
+	}
+	if !strings.Contains(stderr, "ERROR") || !strings.Contains(stderr, "注入的 ack 失败") {
+		t.Errorf("ack 失败 stderr = %q，期望含 ERROR 错误行与注入错误信息", stderr)
+	}
+
+	// 位点未推进（零副作用）：只读 poll 消息仍全部在场、双位点 0。
+	stdout, _ = runWantCode(t, "失败后只读 poll", 0, func() int {
+		return runPoll(ctx, regIdentityArgs(), ts.URL)
+	})
+	if !strings.Contains(stdout, fmt.Sprintf("[%d] normal", seq1)) || !strings.Contains(stdout, fmt.Sprintf("[%d] normal", seq2)) {
+		t.Errorf("ack 失败后消息应全部在场（位点零推进）:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "# pending=2 mailbox_pos=0 dialog_pos=0") {
+		t.Errorf("ack 失败后双位点应仍为 0:\n%s", stdout)
+	}
+
+	// 修好夹具重跑：poll --ack 成功（退 0）→ 再 poll 零重复（恢复面，GET 只读
+	// 重跑无损的实证）。
+	failAcks.Store(false)
+	runWantCode(t, "修复后 poll --ack", 0, func() int {
+		return runPoll(ctx, append(regIdentityArgs(), "--ack"), ts.URL)
+	})
+	stdout, _ = runWantCode(t, "恢复后再 poll", 0, func() int {
+		return runPoll(ctx, regIdentityArgs(), ts.URL)
+	})
+	if want := fmt.Sprintf("# pending=0 mailbox_pos=%d dialog_pos=%d\n", seq2, seq2); stdout != want {
+		t.Errorf("恢复后 poll = %q，期望零重复且双位点=%d", stdout, seq2)
 	}
 }
 

@@ -20,7 +20,7 @@ import (
 // init 命令（FR22）：开源用户第一步——在目标项目目录跑 `aiteam init`，生成接入
 // 脚手架：.aiteam/onboarding.md 通讯域全集（b9 一源一渲染+形态分叉引导——comm-only
 // 原样，full 开工第一读补 planning 第二站）+.aiteam/cli.json+
-// AGENTS.md/CLAUDE.md 一句话自管区块；完整形态另有 planning 渲染件（项目级件+
+// AGENTS.md/CLAUDE.md 接入自管区块（b3 换文版）；完整形态另有 planning 渲染件（项目级件+
 // iterations/<首迭代名>（默认 v0.1）迭代骨架，见 planningArtifacts）+_template
 // 模板整目录原样播种+dev-guide+技能包+post-commit hook。模板经 go:embed 编入
 // 二进制（见模块根包 templates.go），占位符按参数渲染后写出。
@@ -332,8 +332,9 @@ func runInit(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	// 产物④：AGENTS.md 与 CLAUDE.md 双写同款一句话区块（b9：接入细节全部收敛
-	// 在 .aiteam/onboarding.md，区块恒定；三态管理——重跑只刷新区块/无变化跳过；
+	// 产物④：AGENTS.md 与 CLAUDE.md 双写同款接入区块（b9：接入细节全部收敛
+	// 在 .aiteam/onboarding.md；b3：区块文案随版本演进，重跑刷新为新文案；
+	// 三态管理——重跑只刷新区块/无变化跳过；
 	// CLAUDE.md 落区块前精确剔除 b6 时代指针行——自产内容自清理）。
 	block := agentsBlock(*project, *name)
 	if err := applyManagedBlock(cwd, "AGENTS.md", "# AGENTS.md\n\n", block, nil, rep); err != nil {
@@ -419,14 +420,17 @@ func renderTemplate(src string, values map[string]string) string {
 	})
 }
 
-// agentsBlock 组装 aiteam 自管区块文本（b9：一句话引导形态——接入细节全部
-// 收敛在 .aiteam/onboarding.md，本区块恒定不随版本变更；升级不自动刷新
-// onboarding.md——writeIfAbsent 已存在即整文件跳过，升级=手动删除后重跑重播种）。
+// agentsBlock 组装 aiteam 自管区块文本（b3：用户指定版接入引导——独立 CLI 口径
+// +防「给 aiteam 加前缀/绕开默认安装位调用」实战误用；接入细节仍全部收敛在
+// .aiteam/onboarding.md。区块文案随版本演进：重跑 init 经 markerBlock 三态合并
+// 安全刷新标记区间（begin..end 内重写，区间外逐字保留）——已装用户升级=重跑
+// init 即得新文案。onboarding.md 升级不自动刷新——writeIfAbsent 已存在即整文件
+// 跳过，升级=手动删除后重跑重播种）。
 func agentsBlock(project, name string) string {
 	return agentsBegin + "\n" +
 		"## aiteam 多会话通讯接入\n\n" +
-		"本项目使用 aiteam 多会话通讯：AI 会话开工第一动作=读 `.aiteam/onboarding.md`" +
-		"（服务地址/身份四参/五命令/哨兵值守纪律）。\n" +
+		"本项目使用 aiteam 多会话通讯（**独立 CLI**，非任何其他工具的子命令）：命令一律 `~/.aiteam/aiteam <cmd>` 绝对路径裸跑（或 `AITEAM_BIN` 环境变量 / PATH 探测），**勿给 aiteam 加任何前缀**。" +
+		"AI 会话开工第一动作=读 `.aiteam/onboarding.md`（服务地址/身份四参/五命令/哨兵值守纪律）。\n" +
 		agentsEnd + "\n"
 }
 
@@ -456,8 +460,9 @@ func markerBlock(existing, block, begin, end string) (string, bool, error) {
 	}
 }
 
-// applyManagedBlock AGENTS.md/CLAUDE.md 自管区块三态落盘（b9 双写同款一句话区块，
-// W2④；机制在 markerBlock/applyMarkedFile，本函数管文件读取与「不存在→新建」态）：
+// applyManagedBlock AGENTS.md/CLAUDE.md 自管区块三态落盘（b9 双写同款接入区块，
+// b3 换文版文案；机制在 markerBlock/applyMarkedFile，本函数管文件读取与「不存在→
+// 新建」态）：
 // ①不存在→新建（header 为新文件头，如 AGENTS.md 的 # 标题；CLAUDE.md 区块即全文）；
 // ②存在无标记→区块追加到末尾（用户内容逐字保留）；③存在含标记→仅刷新区间，
 // 内容无变化计跳过；畸形标记报错且原文不写回。legacyLines 为 init 历史自产行

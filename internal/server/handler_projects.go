@@ -49,12 +49,13 @@ type projectRegisterSnapshot struct {
 	HeartbeatTimeoutSec *int   `json:"heartbeat_timeout_sec,omitempty"`
 }
 
-// archiveData 端点 #3/#7 响应 data（§2.2：data:{status:"archived"}，恰一字段）。
+// archiveData 端点 #3/#7 响应 data（§2.2：data:{status:"archived"}，恰一字段；
+// M-31 两族 unarchive 逆动词复用同字段面，status 传 active）。
 type archiveData struct {
 	Status string `json:"status"`
 }
 
-// statusFlow 归档动作审计 detail：status 流转精简快照（updated_at 归档后无法
+// statusFlow 归档/复原动作审计 detail：status 流转精简快照（updated_at 归档后无法
 // 免查询取得真值，不入快照；幂等重放时 before.status=archived 诚实反映无变化）。
 type statusFlow struct {
 	Before statusSnapshot `json:"before"`
@@ -268,6 +269,32 @@ func (s *Server) handleProjectArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	types.WriteData(w, http.StatusOK, archiveData{Status: store.ProjectStatusArchived})
+}
+
+// ---- M-31 POST /api/v1/projects/{code}/unarchive ----
+
+// handleProjectUnarchive 反归档端点（M-31，#3 archive 的逆动词）：响应恰
+// {status:"active"}；反归档+审计同事务（UnarchiveProjectWithAudit，§七 往返账
+// 同 archive）；幂等重放照常留痕且 detail 记真实前态。
+func (s *Server) handleProjectUnarchive(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	if _, err := s.st.UnarchiveProjectWithAudit(code,
+		store.AuditEntry{
+			Action:    store.AuditProjectUnarchive,
+			SessionID: sessionIDFromCtx(r.Context()),
+		},
+		// detail 快照在事务内拿到 before 真实行后生成（store 回调）。
+		func(before store.Project) string {
+			return auditDetailJSON(statusFlow{
+				Before: statusSnapshot{Status: before.Status},
+				After:  statusSnapshot{Status: store.ProjectStatusActive},
+			})
+		},
+	); err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	types.WriteData(w, http.StatusOK, archiveData{Status: store.ProjectStatusActive})
 }
 
 // ---- #4 GET /api/v1/projects ----

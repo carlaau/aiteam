@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -24,14 +25,31 @@ import (
 // b5-W3 增量（FR9 跨项目定向）：--to-project flag（仅与 --to-role/--to-session
 // 组合）→ target JSON 增 project 键；404 project_not_found 特判冻结文案；镜像行
 // additive 第七字段 to_project。项目内路径行为逐字节不变（AC9.4）。
+// b2-T4 增量（R3/M-34①）：--bus 且发送方 role 非 controller 前缀 → 发送前
+// stderr 追加一行误用提示（警示不拒绝；stdout/--json 机器可读面零污染）。
+// b4-T1 增量（R1 目标解析预览，b4-spec §二.R1）：--dry-run flag（解析目标输出
+// 全貌后不发送，零网络零落库——分支位于镜像根解析与 buildClient 之前）+
+// 默认发送成功输出追加目标摘要行（OK 行之后）+--json 增 resolved_target 尾键
+// （additive/omitempty，口径同 pollAckData.acked_to）；dry-run 与实发摘要共用
+// sendResolvedTarget 解析面（AC1④ 一致性的单点保证）；bus 误用提示抽
+// printBusMisuseHint 单点供 dry-run 复用（预览面提示与实发面一致）。
+// b4-T2 增量（R2 歧义告警，b4-spec §二.R2）：--to-session 值匹配 ^[a-z]+_
+// （小写字母前缀+下划线，形似角色名）→ 发送前 stderr 告警一行（不拦截，
+// 警示哲学同 M-11/b2-R3）；抽 printSessionAmbiguityHint 单点，dry-run 与
+// 实发两面一致输出（调用位紧随 printBusMisuseHint——chat/bus 三选一互斥，
+// 两提示不同时触发，输出顺序无行为差异）。
 
 // sendMessageData 端点 #9 响应 data（§2.2 #9 恰四字段：seq/created_at/level/kind）
-// ——--json 输出直接序列化本结构，与 #9 响应同构（§4.2）。
+// ——--json 输出直接序列化本结构，与 #9 响应同构（§4.2）。b4-T1/R1 additive
+// 尾键 resolved_target：CLI 侧解析增补（服务端 #9 不回此键，反序列化天然缺省；
+// 成功输出路径恒注入，omitempty 仅为双向复用本结构的对称防线——口径同
+// pollAckData.acked_to）。
 type sendMessageData struct {
-	Seq       int64  `json:"seq"`
-	CreatedAt string `json:"created_at"`
-	Level     string `json:"level"`
-	Kind      string `json:"kind"`
+	Seq            int64               `json:"seq"`
+	CreatedAt      string              `json:"created_at"`
+	Level          string              `json:"level"`
+	Kind           string              `json:"kind"`
+	ResolvedTarget *sendResolvedTarget `json:"resolved_target,omitempty"`
 }
 
 // sendLevels level 白名单（§4.2 --level 枚举）：直接引用 store 的 level 常量
@@ -59,10 +77,11 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	fs := newFlagSet("aiteam send",
 		"用法: aiteam send (--to-role <角色> | --bus | --to-session <会话名>) "+
 			"[--to-project <项目code>] --body <text|-> "+
-			"[--level normal|important|block] [--no-mirror] [--json] [--mirror-root <路径>] "+identityUsage)
+			"[--level normal|important|block] [--no-mirror] [--dry-run] [--json] "+
+			"[--mirror-root <路径>] "+identityUsage)
 	var id identityFlags
 	var toRole, toSession, toProject, level, bodyFlag, mirrorRoot string
-	var bus, noMirror, asJSON bool
+	var bus, noMirror, asJSON, dryRun bool
 	registerCommonFlags(fs, &id)
 	fs.StringVar(&toRole, "to-role", "", "定向：发到 --column 栏目的该角色（三选一）")
 	fs.BoolVar(&bus, "bus", false, "总线模式：全栏目总控可见（三选一）")
@@ -71,6 +90,7 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	fs.StringVar(&level, "level", "normal", "消息分级 normal|important|block")
 	fs.StringVar(&bodyFlag, "body", "", "正文 ≤256KB；值为 - 或缺省且 stdin 非终端时自动读 stdin")
 	fs.BoolVar(&noMirror, "no-mirror", false, "跳过镜像双写（仅故障演练/测试用；默认必须双写）")
+	fs.BoolVar(&dryRun, "dry-run", false, "目标解析预览：解析目标输出全貌后不发送（零网络零落库，b4-T1）")
 	fs.BoolVar(&asJSON, "json", false, "机器可读 JSON 输出（与 #9 响应同构）")
 	fs.StringVar(&mirrorRoot, "mirror-root", "", "镜像根目录覆盖（缺省=当前工作目录，B2-T1）")
 	if proceed, exit := parseFlags(fs, args); !proceed {
@@ -95,6 +115,46 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 		return fail(err)
 	}
 
+	// ①′ b4-T1/R1 目标解析全貌：三形态目标+身份+level 整理为可复用结构——
+	//    dry-run 预览（①″）与实发摘要（④）共用同一解析面（AC1④ 一致性由
+	//    此结构性保证）。解析面=参数可确定的全部信息（项目 code：跨项目=
+	//    --to-project 值、缺省/bus=发送方 --project；栏目 code：direct=发送方
+	//    --column——CLI 无 --to-column 即同栏目定向；目标格/会话=--to-role/
+	//    --to-session 原值），服务端才可知的要素（chat 的会话所属栏目/角色
+	//    格、目标域存在性）按形态标注而非虚构——dry-run 语义=零网络。
+	resolved := target.overview(ident, level)
+
+	// ①″ b4-T1/R1 --dry-run 分支：解析目标输出全貌后不发送，退 0。位置=本地
+	//    校验全链（身份/目标/level/body）之后、镜像根解析与 buildClient（②）
+	//    之前——零网络（不发任何请求）零落库（messages/mirror 双零写）；
+	//    本地校验先行使 dry-run 通过 ⇒ 实发本地校验段必过（预览保真，单向
+	//    蕴含非双向等价：实发后续另有 Getwd 镜像根解析（默认双写未显式
+	//    --mirror-root 时）与 buildClient 配置链（坏 cli.json 退 2）两段本地
+	//    失败位于 dry-run 出口之后，预览不预演——预览不依赖服务配置链，裁量
+	//    合理但两段不预演面如实登记）。
+	if dryRun {
+		// bus 误用提示裁量（b4 开工令留痕）：dry-run 同样走本地解析，非
+		// controller 发 bus 命中同一判定——保持与实发一致的提示输出（预览
+		// 如实呈现「这条 bus 执行者格收不到」）。dry-run 无本地退 2 出口
+		// （rc=0 成功输出），不涉 b2-T4/S1「错误输出掺入提示」面；实发面
+		// 提示位（②′ buildClient 后）零变化，TestSendBusHintNotOnLocalFail
+		// 锚定不破。
+		printBusMisuseHint(target, ident)
+		// b4-T2/R2：会话名歧义告警同样在 dry-run 出口本地重放（与 bus 误用
+		// 提示同裁量——预览保真：「这个会话名形似角色名」在预览面就该看到）。
+		printSessionAmbiguityHint(target)
+		if asJSON {
+			b, err := json.Marshal(resolved)
+			if err != nil {
+				return fail(fmt.Errorf("JSON 序列化失败: %w", err))
+			}
+			fmt.Fprintln(os.Stdout, string(b))
+		} else {
+			fmt.Fprintln(os.Stdout, resolved.summaryLine())
+		}
+		return 0
+	}
+
 	// 镜像根解析前置（B2-T1 推荐口径：镜像根默认=当前工作目录，--mirror-root
 	// 显式覆盖）。仅默认双写且未显式覆盖时才调 Getwd。之所以前移到本地校验
 	// 段：若推迟到 POST 成功之后，Getwd 失败会落在「消息已入库但无 seq 可供
@@ -115,6 +175,34 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	if err != nil {
 		return fail(err)
 	}
+
+	// ②′ bus 误用提示（b2-T4/R3，M-34①，b2-spec §二.R3 原文逐字；位置=buildClient
+	//    之后、POST 之前——b2-T4 质量审 S1 微移）：--bus 且发送方 role 非
+	//    controller 前缀（role 规约三形态 controller/executor/executor_<标识>，
+	//    判定口径=HasPrefix(role, "controller")）→ stderr 追加一行提示。三点裁量
+	//    留痕：
+	//    a. 警示不拒绝——发送照常执行（M-11 同哲学）：bus 发送本身合法（服务端
+	//       对 bus 无角色闸），误用面只在「执行者格收不到」；
+	//    b. 时机=发送前、buildClient 之后——buildClient 属纯本地配置解析非网络
+	//       调用，「警示先行于网络往返」性质不变；且全部本地退 2 路径（参数校验/
+	//       Getwd 环境探测/cli.json 配置链解析）严格先于提示，错误输出保持单一
+	//       焦点零掺入（S1：位置若在 buildClient 前，坏 cli.json 退 2 路径即掺
+	//       入提示行——TestSendBusHintNotOnLocalFail 锚定）；
+	//    c. 通道=stderr（fmt.Fprintln 直写，仓内提示/错误输出同款惯例）——提示
+	//       面向人，stdout（含 --json 形态）机器可读面零污染。
+	//    b4-T1：判定+输出抽 printBusMisuseHint 单点（dry-run 分支同判定复用），
+	//       本调用位置/条件/文案逐字节不变（TestSendBusMisuseHint 锚定）。
+	printBusMisuseHint(target, ident)
+
+	// ②″ b4-T2/R2 会话名歧义告警：--to-session 值匹配 ^[a-z]+_（小写字母
+	// 前缀+下划线，形似角色名 controller_*/executor_*）→ stderr 告警一行
+	// （b4-spec §二.R2 原文逐字）。位置裁量=紧随 bus 误用提示（buildClient
+	// 之后、POST 之前）——与 ②′ 同纪律：全部本地退 2 路径（参数校验/Getwd
+	// 环境探测/cli.json 配置链）严格先于告警，错误输出单一焦点零掺入；
+	// 仅 chat 形态触发（target.kind 判定在函数内），direct/bus 零涉及——
+	// chat 与 bus 三选一互斥，两提示不同时输出，先后顺序无行为差异。
+	printSessionAmbiguityHint(target)
+
 	payload := map[string]any{
 		"target": target.requestBody(ident),
 		"level":  level,
@@ -180,8 +268,11 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 		}
 	}
 
-	// ④ 输出（§4.2）：人类可读 `OK seq=<n> time=<服务端时间>`；--json 与 #9 响应同构。
+	// ④ 输出（§4.2）：人类可读 `OK seq=<n> time=<服务端时间>`+目标摘要行
+	//    （b4-T1/R1：OK 行后追加目标解析摘要段，与 dry-run 同解析面同渲染）；
+	//    --json 增 resolved_target 尾键（additive，成功路径恒注入）。
 	if asJSON {
+		resp.ResolvedTarget = &resolved
 		b, err := json.Marshal(resp)
 		if err != nil {
 			return fail(fmt.Errorf("JSON 序列化失败: %w", err))
@@ -189,6 +280,7 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 		fmt.Fprintln(os.Stdout, string(b))
 	} else {
 		fmt.Fprintf(os.Stdout, "OK seq=%d time=%s\n", resp.Seq, resp.CreatedAt)
+		fmt.Fprintln(os.Stdout, resolved.summaryLine())
 	}
 	return 0
 }
@@ -276,6 +368,95 @@ func (t sendTarget) mirrorLabel(ident client.Identity) string {
 		return "BUS"
 	default:
 		return "session:" + t.session
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 目标解析全貌（b4-T1/R1：dry-run 预览与实发摘要共用的解析面）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// sendResolvedTarget send 目标解析全貌（b4-spec §二.R1）：解析面=CLI 参数可
+// 确定的全部信息，服务端才可知的要素按形态键缺省而非虚构——chat 的目标栏目/
+// 角色格=目标会话所属（服务端按会话名解析，store §3.2 kind 归属注释），bus 无
+// 单栏目目标（项目级广播，column_id 仅审计锚点）。JSON 键集按形态 omitempty
+// （chat 缺 column/role、direct/bus 缺 session；additive 键缺省口径同
+// pollAckData.acked_to）。
+type sendResolvedTarget struct {
+	Kind    string `json:"kind"`              // direct / bus / chat（#9 target.kind 同枚举）
+	Project string `json:"project"`           // 目标项目 code：跨项目=--to-project 值；项目内/bus=发送方 --project
+	Column  string `json:"column,omitempty"`  // direct=发送方 --column（同栏目定向，CLI 无 --to-column）；bus/chat 键缺省
+	Role    string `json:"role,omitempty"`    // direct=--to-role 值；bus=controller（广播唯一投递格，b2-R3 提示同口径）；chat 键缺省
+	Session string `json:"session,omitempty"` // chat=--to-session 值；direct/bus 键缺省
+	Level   string `json:"level"`             // 消息分级（--level，本地白名单已过）
+}
+
+// overview 目标三形态 → 解析全貌构造。项目段与 mirrorLabel 同口径：跨项目取
+// --to-project 值、缺省取发送方项目（bus 恒发送方项目——--to-project+--bus 已
+// 在 resolveSendTarget 退 2 拒绝，无跨项目 bus 路径）。
+func (t sendTarget) overview(ident client.Identity, level string) sendResolvedTarget {
+	proj := ident.Project
+	if t.project != "" {
+		proj = t.project
+	}
+	rt := sendResolvedTarget{Kind: t.kind, Project: proj, Level: level}
+	switch t.kind {
+	case store.MessageKindDirect:
+		rt.Column = ident.Column
+		rt.Role = t.role
+	case store.MessageKindBus:
+		rt.Role = "controller"
+	default: // chat：column/role 属服务端解析面（会话所属），键缺省不虚构
+		rt.Session = t.session
+	}
+	return rt
+}
+
+// summaryLine 文本形态摘要行（b4-spec §二.R1 措辞「目标解析：项目 <p> 栏目
+// <c> → <会话名>(<role> 格)｜direct/chat/bus + level」按形态落位）：bus/chat
+// 的栏目段以语义说明占位（全栏目/会话所属）——参数面不可知的服务端要素如实
+// 标注，不虚构 code。dry-run 与实发摘要共用本渲染（AC1④ 一致性的单点保证）。
+func (rt sendResolvedTarget) summaryLine() string {
+	col, cell := rt.Column, "角色格 "+rt.Role
+	switch rt.Kind {
+	case store.MessageKindBus:
+		col = "全栏目（项目级广播）"
+	case store.MessageKindChat:
+		col = "会话所属（服务端解析）"
+		cell = "会话 " + rt.Session
+	}
+	return fmt.Sprintf("目标解析：项目 %s 栏目 %s → %s｜%s + level %s", rt.Project, col, cell, rt.Kind, rt.Level)
+}
+
+// printBusMisuseHint bus 误用提示单点（b2-T4/R3，M-34①，b2-spec §二.R3 原文
+// 逐字；条件与输出面）：--bus 且发送方 role 非 controller 前缀（role 规约三
+// 形态 controller/executor/executor_<标识>，判定口径=HasPrefix(role,
+// "controller")）→ stderr 追加一行提示（警示不拒绝；stdout/--json 机器可读
+// 面零污染）。b4-T1：抽单点供实发面（buildClient 后位置不变）与 dry-run 面
+// （零网络出口本地重放同一判定——预览面提示与实发面一致）两处复用。
+func printBusMisuseHint(target sendTarget, ident client.Identity) {
+	if target.kind == store.MessageKindBus && !strings.HasPrefix(ident.Role, "controller") {
+		fmt.Fprintln(os.Stderr, "提示：bus 广播仅投递 controller 角色格信箱，执行者格收不到；发给执行者请用 --to-role executor_<标识>（direct 定向）")
+	}
+}
+
+// sessionNameAmbiguousRe R2 歧义判据（b4-spec §二.R2 原文「值匹配 ^[a-z]+_
+// 模式」逐字锚定）：一个及以上小写字母前缀后跟下划线——controller_*/executor_*
+// 角色名族全覆盖；大写起头/纯小写无下划线/下划线起头均不命中（判据忠实，不扩
+// 解释）。裁量①（spec §四）：判据从简，接受低成本误报（如真实会话名恰好小写
+// 前缀+下划线——代价仅一行 stderr 提示，不拦截不污染机器可读面）。
+var sessionNameAmbiguousRe = regexp.MustCompile(`^[a-z]+_`)
+
+// printSessionAmbiguityHint 会话名歧义告警单点（b4-T2/R2，b4-spec §二.R2
+// 原文逐字；条件与输出面）：仅 chat 形态（--to-session 给定）且值命中
+// sessionNameAmbiguousRe → stderr 追加一行告警（警示不拦截，M-11/b2-R3 同
+// 哲学；stdout/--json 机器可读面零污染——通道与 printBusMisuseHint 同款，
+// 告警面向人）。动因=投错格实证：总控把角色名 executor_A 误作会话名传
+// --to-session 两连 404 后仍需人肉排查——发送前一行提示把排查成本压到零。
+// dry-run 面与实发面两处复用（预览保真：预览如实呈现「这个会话名形似角色
+// 名」，与 dry-run 面 bus 误用提示同裁量）。
+func printSessionAmbiguityHint(target sendTarget) {
+	if target.kind == store.MessageKindChat && sessionNameAmbiguousRe.MatchString(target.session) {
+		fmt.Fprintln(os.Stderr, "提示：--to-session 值含下划线，形似角色名（role=executor_<标识>）；会话名惯用连字符——若本意是定向角色格请用 --to-role")
 	}
 }
 

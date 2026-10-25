@@ -640,6 +640,11 @@ func (s *Store) queryColumns(scope *ColumnScope, projectCodes map[int64]string) 
 //     （行过滤语义一致，非逐字同文——彼为行级拉取、此为聚合计数改写形态），位点
 //     join（LEFT JOIN ack_positions，consumer=角色）同 B2 GetPositions 读语义
 //     （缺行 COALESCE 0）——双路径已显式登记，非静默。
+//   - b5-T6 分歧登记（终审建议①）：b5-T1 起 pollVisibleSQL direct 分支追加墓碑
+//     过滤，本查询**不含**——已撤 direct 仍计入待消费 SUM 与 MAX(seq) 最新一条
+//     带出（level/created_at 元数据，body 不外泄）；无害：计数幽灵随该 seq 被 ack
+//     后消散（SUM 归零、最新条被后续可见 seq 置换），位点只进不退，行为零变化是
+//     b5 红线要求。
 func (s *Store) queryDirectStats() (map[boxKey]pendingStat, error) {
 	rows, err := s.DB.Query(`
 SELECT g.column_id, g.target_role, g.pending,
@@ -687,6 +692,12 @@ JOIN messages m ON m.seq = g.latest_seq`)
 // controller）与 B2 pollVisibleSQL bus 分支语义同源（非逐字同文），位点 join 维度
 // 差异（此处 join 消息所在栏目位点，poll 用消费方传入位点）在单栏目 controller
 // 常态下等值，多栏目 controller 为已知近似（assembleMailboxes 注显式声明）。
+//
+// b5-T6 分歧登记（终审建议①）：b5-T1 起 pollVisibleSQL bus 分支追加墓碑过滤，
+// 本查询**不含**——已撤消息仍计入待消费 SUM（level/created_at 元数据，body 不
+// 外泄）；bus v1 不可撤（R1.2 白名单仅 direct/chat，墓碑不可达），分歧暂为理论
+// 面，登记防 bus 开放撤回后口径静默漂移；无害：位点只进不退、计数幽灵随 ack
+// 消散，行为零变化是 b5 红线要求。
 func (s *Store) queryBusStats() (map[int64]pendingStat, error) {
 	rows, err := s.DB.Query(`
 SELECT g.project_id, g.pending,
@@ -925,6 +936,12 @@ func (s *Store) queryResourcesSummary() (ResourcesSummary, error) {
 // 聚合纯读形态，改调即 N+1 破 §3.7 往返基线；行过滤谓词与 pollVisibleSQL 第三
 // 分支（messages.go）同源一致，双路径显式登记非静默——对拍机械闸
 // TestUnreadDialogMatchesPollPredicate。
+//
+// b5-T6 分歧登记（终审建议①，终审扫漏的第五处）：b5-T1 起 pollVisibleSQL 第三
+// 分支追加墓碑过滤，本查询**不含**——已撤 chat（R1.2 可撤白名单 direct/chat；
+// receipt 不可撤）仍计入会话未读计数（纯 COUNT 元数据，body 不外泄）；无害：
+// 位点只进不退、计数幽灵随 ack 消散，行为零变化是 b5 红线要求；对拍闸
+// TestUnreadDialogMatchesPollPredicate 夹具不落墓碑行，两侧可见集恒等不受涉。
 func (s *Store) queryUnreadDialogCounts(sessionIDs []int64) (map[int64]int64, error) {
 	if len(sessionIDs) == 0 {
 		return map[int64]int64{}, nil // 空集早退——IN () 为 SQL 语法错，调用方守卫外再一道自洽防线

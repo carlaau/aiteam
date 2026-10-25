@@ -754,6 +754,112 @@ func TestSendBusWithProjectRejected(t *testing.T) {
 	}
 }
 
+// TestSendChatNotFoundNearbyHint chat 未命中 404 近邻建议段（b4-T3/R3，AC3）。
+// 建议域裁量留痕（spec 裁量②「目标栏目内」在 chat 未命中场景的落地口径）：
+// chat target 无栏目键（§2.2 #9 chat 形态只带 session，CLI 亦键缺省不虚构——
+// send.go resolvedTarget 注），未命中时会话所属栏目不可知——解析域内唯一可知
+// 栏目锚=发送方所在栏目。故：项目内变体建议域=发送方栏目（同栏目协作=动因
+// 主场景，总控 executor_A/executor-A 两连错即同栏目 05；「不跨栏目」字面成立）；
+// 跨项目变体发送方栏目在 A 域不属解析域，退化为目标项目全域（「不跨项目」
+// 字面仍成立）。清单全量不判活（纠名场景历史会话名同样有参考价值），`名称@role`
+// 形态 ≤5 截断（s.id 注册序取前 5）。四个断言面：①项目内清单呈现+形态+截断+
+// 不跨栏目 ②跨项目前缀保持+建议段跟随+不跨项目 ③零近邻零建议段（跨项目空
+// 目标项目——项目内「空栏目」结构性不可达：发送方会话经心跳中间件恒在本栏目）
+// ④direct 分支零变化（既有 TestSendArchivedRejected direct 404 断言零改动背书，
+// 同 -run 'Send|Chat' 面一起跑）。
+func TestSendChatNotFoundNearbyHint(t *testing.T) {
+	h, st := newTestEnv(t)
+	projectID, col05 := seedProjectColumn(t, st, authProj, store.ProjectStatusActive, authCol, store.ColumnStatusActive)
+	col06 := seedColumnOnly(t, st, "p-a", "06", store.ColumnStatusActive)
+	projB, colB07 := seedProjectColumn(t, st, "p-b", store.ProjectStatusActive, "07", store.ColumnStatusActive)
+	seedProjectColumn(t, st, "p-c", store.ProjectStatusActive, "01", store.ColumnStatusActive) // 零会话目标项目
+	injectFixedClock(t, "2026-01-01T08:00:00Z")
+
+	// 05 栏目种 6 会话（s.id 序先于发送方会话——controller-A 经心跳中间件于首个
+	// 请求才 upsert，id 更大）：清单截断到 5=seed-01..05 呈现、seed-06 落选。
+	seedNames := []string{"seed-01", "seed-02", "seed-03", "seed-04", "seed-05", "seed-06"}
+	for _, name := range seedNames {
+		if _, err := st.UpsertSession(projectID, col05, name, "executor"); err != nil {
+			t.Fatalf("预注册 %s 失败: %v", name, err)
+		}
+	}
+	// 跨栏目负锚（06 栏目）：「不跨栏目」——不入项目内建议清单。
+	if _, err := st.UpsertSession(projectID, col06, "outsider-C", "executor"); err != nil {
+		t.Fatalf("预注册 outsider-C 失败: %v", err)
+	}
+	// B 域建议段正锚（p-b/07）。
+	if _, err := st.UpsertSession(projB, colB07, "executor-B", "executor"); err != nil {
+		t.Fatalf("预注册 B 域 executor-B 失败: %v", err)
+	}
+
+	// ① 项目内未命中：前缀锚+清单段（恰 5 条、`名称@role` 形态、s.id 序）+
+	//    第 6 种子截断缺席+跨栏目会话缺席。
+	rr := doAuthedReq(t, h, http.MethodPost, "/api/v1/messages",
+		`{"target":{"kind":"chat","session":"ghost"},"level":"normal","body":"x"}`,
+		authProj, authCol, authSess, authRole)
+	wantErrBody(t, rr, http.StatusNotFound, types.CodeTargetSessionNotFound)
+	msg := errMsg(t, rr)
+	if !strings.Contains(msg, "目标会话未注册: ghost") {
+		t.Errorf("错误信息 %q 不含前缀「目标会话未注册: ghost」（现状文案锚）", msg)
+	}
+	const marker = "；栏目 05 内会话: "
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		t.Fatalf("错误信息 %q 不含建议段锚 %q（AC3.1 目标栏目会话清单）", msg, marker)
+	}
+	got := strings.Split(msg[i+len(marker):], "、")
+	if len(got) != 5 {
+		t.Errorf("建议清单条数 = %d（%v），期望恰 5（≤5 截断，AC3.1）", len(got), got)
+	}
+	for k, g := range got {
+		if want := seedNames[k] + "@executor"; g != want {
+			t.Errorf("建议清单[%d] = %q，期望 %q（`名称@role` 形态+s.id 序，AC3.1）", k, g, want)
+		}
+	}
+	if strings.Contains(msg, "seed-06") {
+		t.Errorf("错误信息 %q 含落选会话 seed-06（6 会话截断到 5）", msg)
+	}
+	if strings.Contains(msg, "outsider-C") {
+		t.Errorf("错误信息 %q 含 06 栏目会话 outsider-C（建议域=发送方栏目，不跨栏目）", msg)
+	}
+
+	// ② 跨项目未命中：前缀形态保持+建议段跟随其后+B 域清单呈现+A 域会话不入
+	//    （不跨项目）。
+	rr = doAuthedReq(t, h, http.MethodPost, "/api/v1/messages",
+		`{"target":{"kind":"chat","project":"p-b","session":"ghost"},"level":"normal","body":"x"}`,
+		authProj, authCol, authSess, authRole)
+	wantErrBody(t, rr, http.StatusNotFound, types.CodeTargetSessionNotFound)
+	msg = errMsg(t, rr)
+	const crossPrefix = "目标项目 p-b 无会话 ghost"
+	if !strings.Contains(msg, crossPrefix) {
+		t.Errorf("错误信息 %q 不含跨项目前缀 %q（AC3.3 前缀形态保持）", msg, crossPrefix)
+	}
+	const crossHint = "executor-B@executor"
+	if !strings.Contains(msg, crossHint) {
+		t.Errorf("错误信息 %q 不含 B 域会话 %s（建议段跟随前缀，AC3.1/AC3.3）", msg, crossHint)
+	} else if pi, hi := strings.Index(msg, crossPrefix), strings.Index(msg, crossHint); pi > hi {
+		t.Errorf("错误信息 %q 前缀(%d)在建议段(%d)之后（建议段须跟随前缀）", msg, pi, hi)
+	}
+	if strings.Contains(msg, "seed-01") {
+		t.Errorf("错误信息 %q 含 A 域会话 seed-01（建议域=目标项目，不跨项目）", msg)
+	}
+
+	// ③ 零近邻零建议段：跨项目空目标项目 → 文案与现状逐字节同（全等锚）。
+	rr = doAuthedReq(t, h, http.MethodPost, "/api/v1/messages",
+		`{"target":{"kind":"chat","project":"p-c","session":"ghost"},"level":"normal","body":"x"}`,
+		authProj, authCol, authSess, authRole)
+	wantErrBody(t, rr, http.StatusNotFound, types.CodeTargetSessionNotFound)
+	if msg := errMsg(t, rr); msg != "目标项目 p-c 无会话 ghost" {
+		t.Errorf("零近邻错误信息 = %q，期望恰现状文案 %q（无近邻不加段，AC3.2）",
+			msg, "目标项目 p-c 无会话 ghost")
+	}
+
+	// 全部 404 拒绝不落库。
+	if got := countTable(t, st, "messages"); got != 0 {
+		t.Errorf("未命中用例后 messages 行数 = %d，期望 0（拒绝不落库）", got)
+	}
+}
+
 // ---- #10 GET /api/v1/mailbox + #11 POST /api/v1/acks（B2-4）----
 
 // queryAckPosition 查 (column, consumer) 位点行值（GET 零推进/ack 幂等零副作用的
@@ -2014,6 +2120,79 @@ func TestSendDirectAgentConflictDoubleAlive(t *testing.T) {
 	}
 	if got := countTable(t, st, "messages"); got != 0 {
 		t.Errorf("拒投后 messages 行数 = %d，期望 0（409 拒投不落库）", got)
+	}
+}
+
+// TestSendDirectAgentConflictClearingHint b2-T2/R4（M-35②）409 清障段（AC4①②）：
+// 双活 409 文案在既有主体（格子+数量+名单+教学语）之后追加，主体整段逐字节锚
+// 证「追加不重写、句式稳定」；追加段=逐会话「最后活跃 <Ns/Nm> 前、预计 <eta>
+// 后过期」（eta=项目级失联阈值−已活秒数，夹具阈值 900——A 已活 300s 锚 Nm 形态
+// 「5m 前/10m 后过期」，B 恰 upsert 锚 Ns 形态「0s 前/15m 后过期」，两格式各锚
+// 一个会话）+尾附旧窗哨兵续活机制提示句（AC4②，HasSuffix 锚收尾）；拒投不落库。
+// 时间敏感断言沿用哨兵域纪律：injectFixedClock 两档注入（t0 注册 A、t0+300s 注册
+// B 并发判定请求），注册与判定同源 types.NowUTC，零真实墙钟。
+func TestSendDirectAgentConflictClearingHint(t *testing.T) {
+	h, st := newTestEnv(t)
+	projectID, columnID := seedProjectColumn(t, st, "p-a", store.ProjectStatusActive, authCol, store.ColumnStatusActive)
+	const t0 = "2026-01-01T10:00:00Z"
+	injectFixedClock(t, t0)
+	if _, err := st.UpsertSession(projectID, columnID, "executor-A", "executor"); err != nil {
+		t.Fatalf("预注册 executor-A 失败: %v", err)
+	}
+	// 时钟推进 300s 再注册 B：判定时 A 已活 300s（Nm 形态）、B 恰 0s（Ns 形态）。
+	injectFixedClock(t, "2026-01-01T10:05:00Z")
+	if _, err := st.UpsertSession(projectID, columnID, "executor-B", "executor"); err != nil {
+		t.Fatalf("预注册 executor-B 失败: %v", err)
+	}
+
+	rr := doAuthedReq(t, h, http.MethodPost, "/api/v1/messages", msgSendBody, heads4()...)
+	wantErrBody(t, rr, http.StatusConflict, types.CodeAgentConflict)
+	msg := errMsg(t, rr)
+	for _, want := range []string{
+		// 既有主体整段逐字节锚（R4「追加不重写」回归锚：主体句式零变化）。
+		"目标 05/executor 格子存在 2 个活会话（executor-A、executor-B），请个体化命名 executor_<标识> 或改用 --bus 广播",
+		// AC4① 逐会话清障段（Ns/Nm 两形态各锚一个）。
+		"executor-A 最后活跃 5m 前、预计 10m 后过期",
+		"executor-B 最后活跃 0s 前、预计 15m 后过期",
+		// AC4② 旧窗哨兵续活机制提示句。
+		"活=失联阈值内（项目级可调）",
+		"被遗忘的旧窗哨兵仍在跑会持续续心跳不过期——关旧窗即自然过期",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息 %q 不含 %q（R4 409 清障段）", msg, want)
+		}
+	}
+	if !strings.HasSuffix(msg, "关旧窗即自然过期") {
+		t.Errorf("错误信息 %q 应以旧窗哨兵机制提示句收尾", msg)
+	}
+	if got := countTable(t, st, "messages"); got != 0 {
+		t.Errorf("拒投后 messages 行数 = %d，期望 0（409 拒投不落库）", got)
+	}
+}
+
+// TestFmtHeartbeatDur fmtHeartbeatDur 拐点表测试（b2-T2 质量审建议采纳）：纯函数
+// 逐值锚 Ns/Nm 两形态与 60s 截断拐点——90/599 特锚「截断至分」语义（整数除法
+// 向下截断而非四舍五入：90s=1m 而非 2m、599s=9m 而非 10m）。既有集成断言
+// （ClearingHint/Passthrough）只覆盖整倍数值（0/300/600/900s），拐点行为此前
+// 无独立失败面。
+func TestFmtHeartbeatDur(t *testing.T) {
+	for _, tc := range []struct {
+		sec  int
+		want string
+	}{
+		{0, "0s"},
+		{1, "1s"},
+		{59, "59s"}, // <60s 上界：逐秒形态
+		{60, "1m"},  // 拐点：入分形态
+		{61, "1m"},
+		{90, "1m"},  // 截断非四舍五入（90/60=1.5 → 1m）
+		{599, "9m"}, // 同上（599/60≈9.98 → 9m）
+		{600, "10m"},
+		{900, "15m"}, // 夹具默认阈值量级（ClearingHint 的 B 会话 eta）
+	} {
+		if got := fmtHeartbeatDur(tc.sec); got != tc.want {
+			t.Errorf("fmtHeartbeatDur(%d) = %q，期望 %q", tc.sec, got, tc.want)
+		}
 	}
 }
 

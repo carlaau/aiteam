@@ -293,6 +293,79 @@ func (s *Store) ArchiveColumnWithAudit(projectCode, colCode string, entry AuditE
 	return audit, nil
 }
 
+// columnUnarchiveSQL 栏目反归档单源语句（UnarchiveColumn 与事务变体共用）：CASE
+// 幂等语义镜像 columnArchiveSQL（同 projectUnarchiveSQL 口径）。
+const columnUnarchiveSQL = `UPDATE columns
+ SET status = 'active',
+     updated_at = CASE WHEN status = 'archived' THEN ? ELSE updated_at END
+ WHERE code = ? AND project_id = (SELECT id FROM projects WHERE code = ?)`
+
+// UnarchiveColumn 反归档（M-31 数据面，archive 的逆动词）：纯反归档版（无审计），
+// 事务变体见 UnarchiveColumnWithAudit——handler 层反归档动作用 WithAudit 版。
+// 幂等语义「目标不存在才 404」：已 active 再 unarchive 幂等成功且不刷 updated_at
+// （CASE 表达式保持原值），单条 UPDATE 完成；命中 0 行（项目或栏目不存在均归并）
+// 返回 ErrColumnNotFound。反归档不动历史与位点（archive 保留语义的逆操作面）。
+func (s *Store) UnarchiveColumn(projectCode, colCode string) error {
+	res, err := s.DB.Exec(columnUnarchiveSQL, types.NowUTC(), colCode, projectCode)
+	if err != nil {
+		return fmt.Errorf("store: 反归档栏目 %q 失败: %w", colCode, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: 读取反归档栏目 %q 影响行数失败: %w", colCode, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: 项目 %s 栏目 %s", ErrColumnNotFound, projectCode, colCode)
+	}
+	return nil
+}
+
+// UnarchiveColumnWithAudit 栏目反归档+审计同事务（M-31 的 handler 写路径，§七
+// 往返账同 archive）：SELECT before + UPDATE（CASE 幂等语义保留，位点不受影响）
+// + INSERT audit 单事务 3 语句（实测账，口径同 ArchiveColumnWithAudit）。幂等
+// 重放照常留痕且 detail 记真实前态（重放时 before.Status=active）。
+func (s *Store) UnarchiveColumnWithAudit(projectCode, colCode string, entry AuditEntry, detailFn func(before Column) string) (AuditEntry, error) {
+	tx, err := s.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 开启反归档栏目事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	before, err := scanColumn(tx.QueryRow(
+		`SELECT `+columnColumns+`
+		 FROM columns
+		 WHERE code = ? AND project_id = (SELECT id FROM projects WHERE code = ?)`,
+		colCode, projectCode,
+	).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuditEntry{}, fmt.Errorf("%w: 项目 %s 栏目 %s", ErrColumnNotFound, projectCode, colCode)
+	}
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 定位项目 %q 栏目 %q 失败: %w", projectCode, colCode, err)
+	}
+
+	res, err := tx.Exec(columnUnarchiveSQL, types.NowUTC(), colCode, projectCode)
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 反归档栏目 %q 失败: %w", colCode, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		// before SELECT 与 UPDATE 间目标被并发删除的竞态兜底。
+		return AuditEntry{}, fmt.Errorf("%w: 项目 %s 栏目 %s", ErrColumnNotFound, projectCode, colCode)
+	}
+
+	entry.ProjectID = before.ProjectID
+	entry.ColumnID = before.ID
+	entry.Detail = detailFn(before)
+	audit, err := insertAuditRow(tx, entry)
+	if err != nil {
+		return AuditEntry{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 提交反归档栏目事务失败: %w", err)
+	}
+	return audit, nil
+}
+
 // ListColumns 栏目列表（§2.2 #8 数据面）：按项目 code 定位（未命中复用
 // GetProjectByCode 返回 ErrProjectNotFound），默认仅 active，includeArchived=true
 // 全含；按 created_at,id 稳定升序（TEXT ISO8601 字典序=时间序，§3.1 第 1 条）；

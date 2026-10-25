@@ -20,17 +20,45 @@
 
 - **Use the product**: start `aiteam serve` on a server machine, connect your AI sessions via the CLI (see the quick start below), then optionally run `aiteam init` in *your own project* to bootstrap the methodology.
 - **Hack the source / contribute**: fork this repo, build with `bash scripts/build.sh`, pass the pre-commit gates (`bash scripts/check.sh` + `bash scripts/check-sanitize.sh --strict`). MIT licensed.
+- **Two scenarios, one bus**: development collaboration (with or without the S0–S7 methodology pack — `aiteam init` seeds it, `--comm-only` skips it), and non-code AI collaboration (images, docs, reviews, cross-checks): any agent-capable client (local command or MCP, e.g. ZCode, Doubao, WorkBuddy) joins the bus directly, so humans stop being the copy-paste relay between AI tools.
 
 ## 核心能力一览
 
 - **跨机分布式协作**：单点服务 + N 机接入，会话不挑客户端——分散在各机的 AI 会话像坐在同一间办公室（信箱/位点/回执）；人经只读看板全局监督、按会话对话
-- **信号收发不丢不重**：定向 / 总线 / 会话对话三形态消息，全局唯一序号、服务端权威时间戳、阻断级消息强制回执闭环
+- **信号收发不丢不重**：定向 / 总线 / 会话对话三形态消息，全局唯一序号、服务端权威时间戳、阻断级消息强制回执闭环（未消费窗口内发送方可撤回 direct/chat——bus/block/receipt 除外）
 - **一条命令恢复现场**：会话上下文压缩 / 重开后，`status` 单命令输出各栏目在途状态、待消费、阻断未回执、哨兵活性、时间窗
 - **资源冲突机械闸**：端口 / 测试账号段 / 测试数据段先登记后使用，与在用资源冲突的登记直接拒绝
 - **人机各得其所**：AI 会话走 CLI，人看 Web 看板（只读全局状态 + 按会话对话）
 - **部署极简**：Go 单二进制 + SQLite 单文件（WAL 模式），拷贝到内网任一空目录启动即就绪
 
 ![aiteam Web 看板——桌面三列布局（暗色主题）：项目-栏目-会话树 ｜ 对话面板 ｜ 总线消息流](docs/assets/board-desktop-dark.png)
+
+## 适用场景：不止于开发
+
+**aiteam = 通讯中枢 + 可选方法论文档包**：`aiteam init` 播种 S0~S7 流水线骨架（planning 模板 + 技能包）；`aiteam init --comm-only` 只装纯信箱总线——两档通讯能力完全一致，方法论不强加。
+
+**场景一 · 开发协同**：AI 会话以「项目 / 栏目 / 会话 / 角色」四参挂上总线，五命令构成拉取式信箱——任务派发、DONE 回执、block 级插队、跨项目路由。想要完整迭代纪律的团队配合 init 播种的方法论文档包走 S0~S7；已有自己研发流程的团队 `--comm-only` 纯信箱即够。
+
+**场景二 · 非开发的 AI 协同**（`--comm-only` 自然入口）：做图、做文档、做走查等非代码工作同样适用——协调信息与上下文走总线，产出物走共享存储路径引用。
+
+**例：做一份产品宣传手册**——你对资料 AI 下要求，它整理出要点提纲发上总线；文案 AI 接力产出初稿；配图 AI 按文案出图，把共享盘里的图片路径发回来；校对 AI 对照你的原始要求逐项核对、把问题清单发回。你在看板上看到每一步往来，随时插话改方向——不在任何两个工具之间复制粘贴。
+
+更多形态：
+
+- **设计走查**（设计师）：AI 出三版海报，另一个 AI 对照需求清单逐项挑毛病（文案/字体/风格），修完再走一轮直至清零；
+- **文档评审**（行政/法务）：起草 AI 出标书或制度稿，评审 AI 以挑错角色逐段核对数据与条款一致性，分歧处人来裁；
+- **数据复核**（财务/运营）：一个 AI 出月度报表，另一个 AI 独立复算关键数字，对不上直接回消息指到差异行。
+
+判断标准：**多方、多轮、上下文重、周期性**的协同收益最大；两方一轮的小事用 IM 更快。
+
+| 维度 | IM 群 + 人肉搬运 | aiteam 总线直连 |
+|---|---|---|
+| 上下文保真 | 人转述丢一层，对面 AI 多问一轮 | 结构化全文机器对机器，逐字不丢 |
+| 到达时延 | 取决于人何时看屏幕 | poll / watch 秒级 |
+| 可审计 | 消息滚走、文件过期 | 全局序号 + 不丢不重 + 看板时间线 |
+| 分级打断 | @ 消息与刷屏 | block / important / normal 三级 |
+
+**两条边界，如实说明**：①参与者 AI 须为 agent 形态——支持本地命令或 MCP 连接的客户端均可（ZCode、豆包、WorkBuddy 等）；纯网页对话工具接不进来。②总线传文本不传文件——产出物请落共享存储，消息里引用路径。
 
 ## 第一次用：把仓库地址交给 AI 引导安装
 
@@ -94,7 +122,8 @@ aiteam column register --project proj-a --code 05 --name "S4 写码" …
 #    类广播（面向全体）不用 role 目标，发消息改用 --bus
 
 # 5) 收发与值守（…=你的身份四参）
-aiteam poll …        # 拉自己信箱；幂等重拉不推进位点，重复执行安全
+aiteam poll …        # 拉自己信箱；幂等重拉不推进位点，重复执行安全——poll 只读、
+                     # ack 才消费；一键=poll --ack
                      # 防呆（role 错格自判）：本格无定向消息而同栏目他格有未消费定向时，
                      # stderr 出一行「提示：本格（role=<你的role>）无定向消息；同栏目
                      # role=<格> 格有 N 条未消费定向——若你的身份应为该格，检查 --role
@@ -104,7 +133,8 @@ aiteam send … --to-role controller --level important --body "05 栏目完成�
                      # 定向回复总控；级别 normal|important|block（默认 normal）
                      # 跨项目定向：加 --to-project <项目code>（仅与 --to-role/--to-session
                      # 组合，--bus 不支持跨项目）——发到同服务另一项目的目标角色/会话
-aiteam ack …         # 处理完推进消费位点；block 级消息须逐条 --receipt <seq> 回执
+aiteam ack …         # 处理完推进消费位点；block 级消息须逐条 --receipt <seq> 回执——
+                     # poll 只读、ack 才消费；一键=poll --ack
 aiteam watch … &     # 后台哨兵值守信箱，命中新消息即退出（退出码 0）唤醒你
                      # 命中行带投递面标注：HIT seq=<n> level=<l> kind=<k> target=<t>——
                      # kind=direct→target=目标角色值（定向信投的格）；chat/receipt→
@@ -261,8 +291,8 @@ aiteam status --global --session controller-A --role controller    # 跨项目�
 
 到此**通讯链路已完整跑通**。aiteam 有两条用法，**二选一**（`aiteam init` 完全可选；§5 单机与多机接入 / §6 日常运维对两条路通用）：
 
-- **只用通讯，到此为止**：把 aiteam 当纯信箱总线用——各项目 AI 会话直接照[文首接入指令](#给-ai-会话的接入指令)以五核心命令收发，不需要 init、不引入方法论。**长期用通讯想让新会话自动知道 aiteam**：项目根跑 `aiteam init --comm-only`（四件产物：`.aiteam/onboarding.md` 启动指令 + `.aiteam/cli.json` + AGENTS.md/CLAUDE.md 一句话区块，不装方法论模板，已有自己规划体系的仓库零污染）——之后 AI 客户端开窗自动读到区块一句话引导，按其读 `.aiteam/onboarding.md` 自举，零人工贴指令。升级 aiteam 后的换新口径：AGENTS.md/CLAUDE.md 区块=恒定一句话不随版本变（区块外你的内容零触碰，无需动）；接入细节在 `.aiteam/onboarding.md`——升级=手动删除该文件后重跑 `aiteam init --comm-only` 重新播种（不删则 init 跳过不覆盖，旧版继续在用；`cli.json` 与镜像审计行不动）。旧版中文名产物（`.aiteam/启动指令.md`）在 init 播种新名后会收到「确认新版在位后可手动删除旧文件」提示，init 不自动删。
-- **启用完整开发方法论**：在你的开发项目根跑 `aiteam init`（生成 `.aiteam/onboarding.md` + docs/planning/ 渲染件 11 件 + `_template/` 模板全套 21 件 + AGENTS.md/CLAUDE.md 一句话区块 + docs/dev-guide/base.md + 进度 hook），走 S0~S7 多会话流水线——见[在你的项目里启用这套开发方法论](#在你的项目里启用这套开发方法论)。
+- **只用通讯，到此为止**：把 aiteam 当纯信箱总线用——各项目 AI 会话直接照[文首接入指令](#给-ai-会话的接入指令)以五核心命令收发，不需要 init、不引入方法论。**长期用通讯想让新会话自动知道 aiteam**：项目根跑 `aiteam init --comm-only`（四件产物：`.aiteam/onboarding.md` 启动指令 + `.aiteam/cli.json` + AGENTS.md/CLAUDE.md 接入区块，不装方法论模板，已有自己规划体系的仓库零污染）——之后 AI 客户端开窗自动读到区块接入引导，按其读 `.aiteam/onboarding.md` 自举，零人工贴指令。升级 aiteam 后的换新口径：AGENTS.md/CLAUDE.md 接入区块文案随版本演进——升级后重跑 `aiteam init --comm-only` 即经标记区间安全刷新为新文案（区块外你的内容零触碰，无需手动改）；接入细节在 `.aiteam/onboarding.md`——升级=手动删除该文件后重跑 `aiteam init --comm-only` 重新播种（不删则 init 跳过不覆盖，旧版继续在用；`cli.json` 与镜像审计行不动）。旧版中文名产物（`.aiteam/启动指令.md`）在 init 播种新名后会收到「确认新版在位后可手动删除旧文件」提示，init 不自动删。
+- **启用完整开发方法论**：在你的开发项目根跑 `aiteam init`（生成 `.aiteam/onboarding.md` + docs/planning/ 渲染件 11 件 + `_template/` 模板全套 21 件 + AGENTS.md/CLAUDE.md 接入区块 + docs/dev-guide/base.md + 进度 hook），走 S0~S7 多会话流水线——见[在你的项目里启用这套开发方法论](#在你的项目里启用这套开发方法论)。
 
 ### 5. 单机与多机接入
 
@@ -364,7 +394,7 @@ cd <你的项目根>
 aiteam init --project <项目code> --name "<项目名>"
 # 生成物（幂等，重跑只补缺不覆盖）：
 #   .aiteam/           onboarding.md（启动指令·通讯域全集：贴窗变体本体）+ cli.json（服务连接配置）
-#   AGENTS.md/CLAUDE.md aiteam 一句话区块（开工第一读=.aiteam/onboarding.md；区块外你的内容零触碰）
+#   AGENTS.md/CLAUDE.md aiteam 接入区块（开工第一读=.aiteam/onboarding.md；区块外你的内容零触碰）
 #   docs/planning/     渲染件 11（占位符已按你的项目参数渲染）——项目级 6：project-status.md（红绿灯，
 #                      当前允许/禁止动作）/executor-contract.md（执行者契约）/methodology.md（方法论段）/
 #                      CONTEXT.md（术语表）/maintenance.md（维护清单）/s0-s7-stages.md（S0~S7 阶段模板）+
@@ -372,7 +402,7 @@ aiteam init --project <项目code> --name "<项目名>"
 #                      development-task.md 任务档）+specs/INDEX.md（spec 登记簿）
 #   docs/planning/_template/  模板全套 21 件原样播种（占位符不渲染，供复制取用——见下「完整一套」）
 #   docs/dev-guide/    base.md 工程通用纪律（§5.5 拓扑节按 --topology 注入）
-#   .agents/skills/   13 个方法论执行技能（契约五步链引用的 Skill 实体；merge：
+#   .agents/skills/   15 个方法论执行技能（契约五步链引用的 Skill 实体；merge：
 #                      同名保留你的现有版本，仅新增缺失）
 #   .git/hooks/        post-commit 进度自动上报（--vcs svn 时跳过，改 progress 手动上报）
 # 完整一套：_template/ 模板体系=演进件源——方法论文档包 21 件随本仓库发布（上列渲染件与 onboarding
@@ -389,8 +419,8 @@ aiteam init --project <项目code> --name "<项目名>"
 
 **AI 会话怎么自动接入？** 靠 AGENTS.md 自举链路，全程零人工指令：
 
-1. `aiteam init` 在项目根生成 **AGENTS.md 一句话区块**：aiteam 管理的内容只存在于 `aiteam:begin` / `aiteam:end` 标记之间且恒定一句话（开工第一读=读 `.aiteam/onboarding.md`），**不随版本演进变化**，区块外你的内容**零触碰**。同时双写 CLAUDE.md 同款区块，兼容不同客户端的读取习惯；接入细节全部落在 `.aiteam/onboarding.md`（init 播种，升级=删除后重跑 init 重播种）。
-2. **zcode / Claude Code 等支持项目级 AGENTS.md 的客户端**在项目根开窗时自动读取该文件——区块一句话引导会话去读 `.aiteam/onboarding.md`（服务地址与 cli.json 指引 / 身份规约 / 五核心命令 / 哨兵纪律都在其中），会话自举接入，免贴任何指令。
+1. `aiteam init` 在项目根生成 **AGENTS.md 接入区块**：aiteam 管理的内容只存在于 `aiteam:begin` / `aiteam:end` 标记之间（开工第一读=读 `.aiteam/onboarding.md`），文案**随版本演进**——重跑 `aiteam init` 即经标记区间安全刷新为新文案，区块外你的内容**零触碰**。同时双写 CLAUDE.md 同款区块，兼容不同客户端的读取习惯；接入细节全部落在 `.aiteam/onboarding.md`（init 播种，升级=删除后重跑 init 重播种）。
+2. **zcode / Claude Code 等支持项目级 AGENTS.md 的客户端**在项目根开窗时自动读取该文件——区块接入引导会话去读 `.aiteam/onboarding.md`（服务地址与 cli.json 指引 / 身份规约 / 五核心命令 / 哨兵纪律都在其中），会话自举接入，免贴任何指令。
 3. 本节只讲自举链路；onboarding.md 的变体贴法（总控版 / 执行者 A/B/C）见其文件头使用规则，具体内容以你手上版本实际生成为准。客户端不支持 AGENTS.md 或走「只用通讯」路的，贴[文首接入指令](#给-ai-会话的接入指令)即可，两条路等效。
 4. 执行者窗贴 `.aiteam/onboarding.md` 对应执行者变体（总控版 / 执行者 A/B/C；两要素：**你是谁** + **听哪**），S4 开窗并行时逐窗粘贴（模板源=[_template/onboarding.md](docs/planning/_template/onboarding.md)）。
 
@@ -406,20 +436,22 @@ aiteam init --project <项目code> --name "<项目名>"
 
 ### 命令族速查（按场景）
 
-对外口径是**五核心命令**（`send` / `poll` / `ack` / `status` / `watch`）；下表按场景列出全部命令面。所有带会话语义的命令均需身份四参 `--project --column --session --role`；服务地址与 token 按上文解析链解析；五核心与 `status` / `watch` / `history` 支持 `--json` 机器可读输出。
+对外口径是**五核心命令**（`send` / `poll` / `ack` / `status` / `watch`）；下表按场景列出全部命令面。所有带会话语义的命令均需身份四参 `--project --column --session --role`；服务地址与 token 按上文解析链解析；五核心与 `status` / `watch` / `history` 支持 `--json` 机器可读输出。每级均可 `--help` 自助查参：`aiteam --help`（或裸 `aiteam`）列子命令总览，`aiteam <子命令> --help`（如 `aiteam send --help`）与 `aiteam <组> <动词> --help`（如 `aiteam project register --help`）看完整用法；动词组先裸 `aiteam project` / `aiteam column` 看族内动词清单。
 
 | 命令 | 用途 | 关键 flag |
 |------|------|-----------|
 | **通讯（日常收发六命令）** | | |
-| `send` | 发消息（定向 / 总线 / 会话对话三形态） | 目标三选一 `--to-role` / `--bus` / `--to-session`；`--level normal\|important\|block`（默认 normal）；`--body`（或 stdin 管道）；`--no-mirror` 跳过镜像双写 |
-| `poll` | 拉取位点之后未消费消息（幂等，不推进位点） | `--limit`（默认 500 条分页，`--limit 0`=全量）；`--json` |
-| `ack` | 推进消费位点 + 阻断消息逐条回执 | `--seq` 显式推进到该序号；`--receipt <seq[,seq...]>` 回执 |
+| `send` | 发消息（定向 / 总线 / 会话对话三形态） | 目标三选一 `--to-role` / `--bus` / `--to-session`；`--level normal\|important\|block`（默认 normal）；`--body`（或 stdin 管道）；`--no-mirror` 跳过镜像双写；`--dry-run` 目标预览不发送（零网络零落库） |
+| `poll` | 拉取位点之后未消费消息（幂等，不推进位点——poll 只读、ack 才消费；一键=poll --ack） | `--limit`（默认 500 条分页，`--limit 0`=全量）；`--json`；`--ack`（拉到即推进位点；一键消费） |
+| `ack` | 推进消费位点 + 阻断消息逐条回执（poll 只读、ack 才消费；一键=poll --ack） | `--seq` 显式推进到该序号；`--receipt <seq[,seq...]>` 回执 |
 | `status` | 单栏目现场 / 全局总览（恢复现场一条命令） | 单栏目 `--project --column`；全局 `--global`；`--all` 含已注销；`--json` |
 | `watch` | 信箱哨兵：命中新消息即退出（配合会话内后台任务 `&`） | `--interval`（默认 5s）；`--max-wait`（默认无限=只在有新消息时唤醒；设值后到时也会唤醒一次，退出码 6）；`--json` |
 | `history` | 通用历史 / 审计查询（block 级含回执状态） | `--kind`；`--level`；`--sent-by`；`--limit`；`--json` |
+| **消息撤回** | | |
+| `recall` | 未消费窗口内撤回自己发的 direct/chat 消息（bus/block/receipt 不可撤） | `--seq <n>` 必填（要撤回的消息序号）；`--reason <text>` 可选（审计留痕） |
 | **登记族（项目 / 栏目 / 会话 / 审计）** | | |
-| `project register / update / archive / list` | 项目登记 / 修改 / 注销 / 查询 | 目标参数 `--code`（见上文撞名坑）；`--name`；`--heartbeat-timeout` 项目级失联阈值；`--all` |
-| `column register / update / archive / list` | 栏目登记 / 修改 / 注销 / 查询 | `--project`（一参两用：身份项目=父项目）；`--code`；`--name` |
+| `project register / update / archive / unarchive / list` | 项目登记 / 修改 / 注销 / 软删恢复（幂等）/ 查询 | 目标参数 `--code`（见上文撞名坑）；`--name`；`--heartbeat-timeout` 项目级失联阈值；`--all` |
+| `column register / update / archive / unarchive / list` | 栏目登记 / 修改 / 注销 / 软删恢复（幂等）/ 查询 | `--project`（一参两用：身份项目=父项目）；`--code`；`--name` |
 | `session list` | 会话心跳面（在线 / 失联 + 哨兵活性） | `--project`（兼作过滤） |
 | `audit` | 登记类操作留痕查询 | `--action`；`--limit` |
 | **资源与调度** | | |
@@ -427,12 +459,13 @@ aiteam init --project <项目code> --name "<项目名>"
 | `window set / list / now` | 阶段时间窗配置与「当前允许阶段」权威查询（软闸，不拦截通讯） | `--stage S4`；`--from 23:00 --to 09:00`（支持跨午夜）；`--clear` 删除该窗；`--project-level` 项目默认窗 |
 | **观测与运维** | | |
 | `progress` / `progress list` | 进度上报（任务收口手动层）/ 进度查询（看板同源） | `--batch`；`--task`；`--commit`；`--branch`；`--tests pass\|fail\|unknown`；`--summary`；list 支持 `--project`/`--session`/`--limit` |
-| `init` | 生成方法论骨架：`.aiteam/onboarding.md` 启动指令播种 + planning 渲染件 11 + `_template/` 模板全套 21 件 + AGENTS.md/CLAUDE.md 一句话区块 + `.agents/skills/` 技能包 + 进度 hook + 拓扑纪律 | `--project`；`--name`；`--no-skills`；`--vcs git\|svn`；`--topology single\|distributed`（默认 single；重跑幂等增量） |
+| `init` | 生成方法论骨架：`.aiteam/onboarding.md` 启动指令播种 + planning 渲染件 11 + `_template/` 模板全套 21 件 + AGENTS.md/CLAUDE.md 接入区块 + `.agents/skills/` 技能包 + 进度 hook + 拓扑纪律 | `--project`；`--name`；`--no-skills`；`--vcs git\|svn`；`--topology single\|distributed`（默认 single；重跑幂等增量） |
 | `backup` | 数据库在线热备 | `--out <file>` |
 | `config` | `init` 生成 / 管理本地服务配置文件 | 语义见[人类一步步配置 §3](#人类一步步配置)；在当前目录生成（维护命令），放 exe 同目录才会被 serve 探测 |
 | `serve` | 启动服务（首次启动自动建库建表） | `--config <path>`（缺省探测 exe 同目录 `aiteam-config.json`，无则首跑自动生成；库落 exe 同目录 `db/`） |
 | `version` | 查看版本 | — |
 
+注：`send` 发送成功输出（文本形态）为两行——`OK seq=<n> time=<服务端时间>` 行后附目标解析摘要行（`目标解析：项目 <p> 栏目 <c> → <目标格/会话>｜direct/chat/bus + level <l>`，目标解析结果可见，跨项目/跨栏目误发一眼可辨；`--dry-run` 预览即同款摘要行，发送前可先行核对）；`--json` 形态增 `resolved_target` 键（同解析面）。
 注：`send` 成功后自动在发送方项目仓库 `.aiteam/` 目录下追加一行镜像（审计快照，git 跟踪，随项目正常提交流程走）；镜像写失败时消息已入库，退出码 5 并在 stderr 给出待补行。
 
 ### Web 看板（桌面三列 / 移动两页）
@@ -467,6 +500,7 @@ aiteam init --project <项目code> --name "<项目名>"
 - **多执行者同用 `executor` 角色名？** 禁止——信箱按 role 分格、一格一人，同格两人=抢信（消息被先 poll 的拿走）+吞信（对方以为已送达）。多执行者各用 `executor_<标识>` 占一格；换班才用裸值顶岗。
 - **已有 `.agents/skills/`（或装过同源技能）会冲突吗？** merge 语义：同名技能**保留你的现有版本**（绝不覆盖），只新增缺失的——init 汇总会列出「新增 N，保留现有 M」计数；要换 aiteam 版=删该技能目录后重跑 init。
 - **CLI 报服务不可达？** 任何命令服务不可达时统一退出 3 并在 stderr 给出原因与实际 server 地址——无静默失败、无本地假状态；查服务进程与地址解析链后重试。
+- **发错了怎么办？** 三阶梯：①发送前用 `aiteam send --dry-run` 预览目标解析，核对无误再发（预防）；②已发出且**对方尚未拉取**时用 `aiteam recall --seq <n>` 撤回（仅限自己发的 direct/chat，bus/block/receipt 不可撤）；③已消费不可撤，可追发更正——对方已拉取后再撤报 409，直接补发一条更正消息即可。
 
 ### 退出码速查
 

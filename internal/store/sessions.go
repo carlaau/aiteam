@@ -307,6 +307,57 @@ func (s *Store) GetSessionByName(projectID int64, name string) (Session, error) 
 	return se, nil
 }
 
+// SessionNameRole 会话名+角色二元组（chat 404 近邻建议段数据面，b4-T3/R3——
+// 仅建议文案消费，无需 Session 全字段）。
+type SessionNameRole struct {
+	Name string
+	Role string
+}
+
+// ListSessionNamesForHint 目标域会话名清单（#9 chat 404 target_session_not_found
+// 近邻建议段数据面，b4-T3/R3，只读零写路径）：columnID<=0=不限栏目（跨项目
+// 变体退化口径，见 handler 调用点注释）。全量不判活——纠名场景失联/历史会话名
+// 同样有参考价值，且免 JOIN projects 判活谓词读面最轻（GetSessionByName 同
+// 论证）；不筛栏目 status（解析域项目恒 active 由 handler 上游域校验保证，
+// archived 栏目中的会话名作纠名参考仍有效）；ORDER BY s.id 注册序稳定（截断
+// 确定性：spec 未定义近邻排序判据，从简不引入相似度排序——裁量①同风格）；
+// LIMIT 由调用方注入（server 侧 ≤5；limit<=0 兜底回默认 5——SQLite LIMIT
+// 负值=无限制，防未来调用方传 0 变全量清单）。
+// 择型留痕（b4-plan T3「store 加同栏目会话名清单查询（或复用既有 ListSessions
+// 过滤，执行者择一留痕）」）：ListSessions 取全字段+失联计算列（须 now/timeout
+// 参数）+全项目行取回再由调用方内存过滤栏目，读面超重；本查询两列+SQL LIMIT
+// 截断，故新增轻查询不复用。空结果返回非 nil 空切片（ListSessions 惯例）。
+func (s *Store) ListSessionNamesForHint(projectID, columnID int64, limit int) ([]SessionNameRole, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	q := `SELECT s.name, s.role FROM sessions s WHERE s.project_id = ?`
+	args := []any{projectID}
+	if columnID > 0 {
+		q += ` AND s.column_id = ?`
+		args = append(args, columnID)
+	}
+	q += ` ORDER BY s.id LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询近邻建议会话清单失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]SessionNameRole, 0)
+	for rows.Next() {
+		var n SessionNameRole
+		if err := rows.Scan(&n.Name, &n.Role); err != nil {
+			return nil, fmt.Errorf("store: 扫描近邻建议会话行失败: %w", err)
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: 遍历近邻建议会话清单失败: %w", err)
+	}
+	return out, nil
+}
+
 // GetSession 按 id 单查（JOIN 装配项目/栏目 code + 失联计算列）。
 // now=判定基准时刻（ISO8601 UTC，注入参数——读路径非写入时间戳，服务端聚合
 // 场景多处查询共享同一 now 保一致性）；defaultTimeoutSec=服务配置
@@ -361,19 +412,40 @@ func (s *Store) ListSessions(projectCode, now string, defaultTimeoutSec int) ([]
 	return out, nil
 }
 
-// ListAliveSessionNames 目标 (project, column, role) 格子的活会话名清单（#9
+// AliveSession 目标格子一个活会话的数据面（#9 agent_conflict 409 清障段数据源，
+// b2-T2/R4——last_seen 扩展择「结构体化」：并行切片需调用方按下标对齐两数组，
+// 结构体自携带对齐关系）。Name 供名单+清障段逐会话行；LastSeenAt=心跳时间戳
+// 原文（ISO8601 UTC）；ElapsedSec=now−last_seen 秒差（判活谓词同款 strftime 算式
+// 于同一查询带回——展示值与判活值零漂移，handler 免二次解析）；TimeoutSec=判活
+// 所用项目级有效阈值 COALESCE(p.heartbeat_timeout_sec, 服务默认)（eta 数据源，
+// eta=TimeoutSec−ElapsedSec；格子限单项目，逐行恒同值，随查询带回免第二条域读）。
+type AliveSession struct {
+	Name       string
+	LastSeenAt string
+	ElapsedSec int
+	TimeoutSec int
+}
+
+// ListAliveSessionNames 目标 (project, column, role) 格子的活会话清单（#9
 // direct agent_conflict 拦截数据面，2026-10-03 增补令·role 规约闸）：活=last_seen
 // 在失联阈值内，与 GetSession/ListSessions 失联计算列完全同口径（同 strftime
 // 秒差算式 + COALESCE(项目级阈值, 服务默认) + p.status='active' 过滤，防口径
 // 漂移；阈值 JOIN projects 取列值，sessionColumns 同款）。一条查询同时供
-// COUNT（len 返回值）与错误信息列名两用（增补令「store 侧一条 COUNT」——
-// 往返账 send 读侧 +1 条）。不 JOIN columns：本查询不取栏目列，轻读面（FK
-// 保证 sessions.column_id 有效行存在，省略 INNER JOIN 不丢行，GetSessionByName
-// 同论证）。空格子返回非 nil 空切片（ListSessions 惯例，防 nil 语义混淆）；
-// ORDER BY s.id 稳定序 = 错误信息列名顺序确定。
-func (s *Store) ListAliveSessionNames(projectID, columnID int64, role, now string, defaultTimeoutSec int) ([]string, error) {
+// COUNT（len 返回值）、名单与 b2-T2/R4 清障段（last_seen/秒差/阈值）三用
+// （增补令「store 侧一条 COUNT」——往返账 send 读侧 +1 条不变）。不 JOIN
+// columns：本查询不取栏目列，轻读面（FK 保证 sessions.column_id 有效行存在，
+// 省略 INNER JOIN 不丢行，GetSessionByName 同论证）。空格子返回非 nil 空切片
+// （ListSessions 惯例，防 nil 语义混淆）；ORDER BY s.id 稳定序 = 名单与清障段
+// 逐会话行顺序均确定。
+//
+// 返回形态变更留痕（b2-T2/R4，2026-10-25）：[]string → []AliveSession。全仓
+// 调用方先经 grep 核实=唯一生产调用点 handler_messages_send.go 409 分支（随
+// 本批同步适配）；测试侧仅注释提及，无调用。
+func (s *Store) ListAliveSessionNames(projectID, columnID int64, role, now string, defaultTimeoutSec int) ([]AliveSession, error) {
 	rows, err := s.DB.Query(
-		`SELECT s.name
+		`SELECT s.name, s.last_seen_at,
+		       (strftime('%s', ?) - strftime('%s', s.last_seen_at)),
+		       COALESCE(p.heartbeat_timeout_sec, ?)
 		 FROM sessions s
 		 JOIN projects p ON p.id = s.project_id
 		 WHERE p.status = 'active'
@@ -381,22 +453,22 @@ func (s *Store) ListAliveSessionNames(projectID, columnID int64, role, now strin
 		   AND (strftime('%s', ?) - strftime('%s', s.last_seen_at))
 		         <= COALESCE(p.heartbeat_timeout_sec, ?)
 		 ORDER BY s.id`,
-		projectID, columnID, role, now, defaultTimeoutSec,
+		now, defaultTimeoutSec, projectID, columnID, role, now, defaultTimeoutSec,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询目标格子活会话失败: %w", err)
 	}
 	defer rows.Close()
-	out := make([]string, 0)
+	out := make([]AliveSession, 0)
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("store: 扫描活会话名失败: %w", err)
+		var a AliveSession
+		if err := rows.Scan(&a.Name, &a.LastSeenAt, &a.ElapsedSec, &a.TimeoutSec); err != nil {
+			return nil, fmt.Errorf("store: 扫描活会话行失败: %w", err)
 		}
-		out = append(out, name)
+		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: 遍历活会话名失败: %w", err)
+		return nil, fmt.Errorf("store: 遍历活会话行失败: %w", err)
 	}
 	return out, nil
 }

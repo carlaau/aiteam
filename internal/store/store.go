@@ -37,6 +37,18 @@ var migrations = []migration{
 	// 跨项目投递=发送方项目 code（AC9.3 审计断言面，b5-spec §1.1-W1①——DDL 与技术
 	// 设计 §3.2 原文逐字一致，含终结分号）。
 	{3, `ALTER TABLE messages ADD COLUMN from_project TEXT NOT NULL DEFAULT '';`},
+	// v0.4-b5 撤回墓碑表（M-36/b5-spec R2.1）：一 seq 一墓碑，messages 表零触碰
+	//（append-only 触发器禁改删，撤回状态流转落独立表）。存量库（user_version≤3
+	// 停版）重开自动补表——表 DDL 单源在本迁移（IF NOT EXISTS 幂等）：b5 是发布后
+	//（v0.1+）首个整表增补，走迁移数组追加面（v2/v3 惯例）；progress_reports 的
+	// schema.sql 直追先例是发布前（2026-10-03 全局变更窗，v0.1.0 已含）特权，发布后
+	// 改 v1 冻结基线只会让存量库（永不重跑 v1）缺表，故不入 schema.sql。
+	{4, `CREATE TABLE IF NOT EXISTS recalled_messages (
+  message_seq         INTEGER PRIMARY KEY REFERENCES messages(seq),
+  recalled_by_session INTEGER NOT NULL,
+  reason              TEXT    NOT NULL DEFAULT '',
+  created_at          TEXT    NOT NULL
+)`},
 }
 
 // SchemaVersion 当前 schema 最新版本号（=migrations 末条 version，版本连续 1..N）。

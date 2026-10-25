@@ -19,6 +19,11 @@ import (
 // 地址（serverOverride）；镜像根一律 --mirror-root 指向 t.TempDir()，测试零依赖
 // 进程 CWD。覆盖 AC5.1/5.3 命令面、AC13.1~13.4、§4.2 flag 面、§8.3 先服务端后
 // 镜像时序、退出码 0/2/3/4/5。
+// b4-T1 增量（R1/AC1）：--dry-run 目标解析预览+默认发送输出摘要+--json
+// resolved_target；既有输出断言更新均在豁免面（b4-spec §二.R1：仅 send 输出
+// 断言）。
+// b4-T2 增量（R2/AC2）：--to-session 下划线歧义告警（chat 形态 stderr 一行，
+// 警示不拦截）——纯新增测试，既有断言零触碰。
 
 // sendMirrorPath 按 §8.1 冻结契约拼镜像文件路径。路径面属冻结契约，测试独立
 // 拼装（与 mirror 包内部拼法互为交叉验证，不依赖其未导出面）。
@@ -76,10 +81,12 @@ func injectStdin(t *testing.T, content string) {
 }
 
 // parseOKLine 解析人类可读成功行 `OK seq=<n> time=<ts>`（§4.2 输出格式），返回
-// 服务端分配的 seq 与服务端时间。
+// 服务端分配的 seq 与服务端时间。b4-T1 起成功输出为两行（OK 行+目标解析摘要
+// 行，b4-spec §二.R1 输出增强），OK 行恒为首行——取首行解析（豁免面更新：仅
+// send 输出断言）。
 func parseOKLine(t *testing.T, stdout string) (int64, string) {
 	t.Helper()
-	line := strings.TrimSpace(stdout)
+	line := strings.TrimSpace(strings.SplitN(stdout, "\n", 2)[0])
 	rest, ok := strings.CutPrefix(line, "OK seq=")
 	if !ok {
 		t.Fatalf("成功输出 = %q，期望 OK seq=<n> time=<ts> 形状", stdout)
@@ -573,8 +580,571 @@ func TestServerFailNoMirror(t *testing.T) {
 	assertNoMirrorFile(t, sendMirrorPath(root, regAuthProject, regAuthColumn))
 }
 
-// TestNoMirror --no-mirror 与 --json：跳过双写不落文件；--json 输出与 #9 响应
-// 同构（恰四键 seq/created_at/level/kind）。
+// TestSendAgentConflictPassthrough b2-T2/R4 AC4④：服务端 409 agent_conflict 清障
+// 文案经 CLI 零改动直透（透传层零改动=设计约束，本测试是锚定而非实现）——CLI
+// fail→APIError.Error 逐字含服务端 message。双活格夹具=historyProbe 四头 GET 经
+// 心跳中间件 upsert 两 executor 会话（零杂音预注册），再以 controller 身份
+// --to-role executor 定向 → 退 4，stderr 含逐会话「最后活跃/后过期」段与旧窗
+// 哨兵机制提示句；镜像零触碰（§8.3）。真实时钟下 elapsed 秒级抖动，断言仅锚
+// 文案骨架不锚具体秒数（时间敏感面的 CLI 侧让位：精确值断言在 server 侧
+// injectFixedClock 用例 TestSendDirectAgentConflictClearingHint）。
+func TestSendAgentConflictPassthrough(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	for _, sess := range []string{"executor-P", "executor-Q"} {
+		historyProbe(t, addr, sess, "executor", "")
+	}
+
+	_, stderr := runWantCode(t, "双活 409 透传", 4, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-role", "executor", "--body", "x", "--mirror-root", root), addr)
+	})
+	for _, want := range []string{
+		"agent_conflict",
+		"executor-P 最后活跃 ",
+		"executor-Q 最后活跃 ",
+		" 前、预计 ",
+		" 后过期",
+		"活=失联阈值内（项目级可调）",
+		"被遗忘的旧窗哨兵仍在跑会持续续心跳不过期——关旧窗即自然过期",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q，不含 %q（R4 服务端清障文案 CLI 直透）", stderr, want)
+		}
+	}
+	assertNoMirrorFile(t, sendMirrorPath(root, regAuthProject, regAuthColumn))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// b2-T4 R3 bus 误用提示（b2-spec §二.R3/AC3，M-34①）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// busMisuseHint R3 提示行逐字模板（b2-spec §二.R3 原文锚定，含全角标点）。
+const busMisuseHint = "提示：bus 广播仅投递 controller 角色格信箱，执行者格收不到；发给执行者请用 --to-role executor_<标识>（direct 定向）"
+
+// TestSendBusMisuseHint AC3 三形态 + 前缀口径边界：①executor 角色发 bus——发送
+// 照常成功（警示不拒绝，M-11 同哲学）+stderr 含 spec 原文提示行（executor 与
+// executor_<标识> 两 role 规约形态均命中——判定=非 controller 前缀）；②controller
+// 角色发 bus——零提示；③--json stdout 零污染（合法 JSON 且不含提示文本）+stderr
+// 仍含提示（提示面向人不因 --json 消失）。边界：非 bus（direct）任何角色零提示。
+func TestSendBusMisuseHint(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+
+	// ① executor_A（带后缀形态）发 bus：rc=0（bus 发送本身合法，服务端无角色
+	// 闸）+ stderr 恰一行 spec 原文提示（成功路径 stderr 本零输出，提示行=唯一
+	// stderr 内容——spec「追加一行」）。
+	stdout, stderr := runWantCode(t, "executor_A 发 bus", 0, func() int {
+		return runSend(ctx, append(identityArgsAs("executor-A", "executor_A"),
+			"--bus", "--body", "执行者误用 bus", "--mirror-root", root), addr)
+	})
+	if seq, _ := parseOKLine(t, stdout); seq <= 0 {
+		t.Errorf("executor_A 发 bus 应照常成功（警示不拒绝），stdout = %q", stdout)
+	}
+	if !strings.Contains(stderr, busMisuseHint) {
+		t.Errorf("executor_A 发 bus stderr = %q，期望含 spec 原文提示行（AC3①）", stderr)
+	}
+	if stderr != busMisuseHint+"\n" {
+		t.Errorf("executor_A 发 bus stderr = %q，期望恰一行提示无杂音", stderr)
+	}
+
+	// ①′ executor（无后缀形态）同样命中（前缀口径：不以 controller 起头即提示）。
+	_, stderr = runWantCode(t, "executor 发 bus", 0, func() int {
+		return runSend(ctx, append(identityArgsAs("executor-B", "executor"),
+			"--bus", "--body", "无后缀执行者 bus", "--mirror-root", root), addr)
+	})
+	if !strings.Contains(stderr, busMisuseHint) {
+		t.Errorf("executor 发 bus stderr = %q，期望含提示行（role 规约三形态之二）", stderr)
+	}
+
+	// ② controller 角色发 bus：零提示（bus 合法受众，M-34① 只拦「执行者格收
+	// 不到」的误用面）。
+	_, stderr = runWantCode(t, "controller 发 bus", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--bus", "--body", "总控的合法 bus", "--mirror-root", root), addr)
+	})
+	if strings.Contains(stderr, "提示：bus 广播") {
+		t.Errorf("controller 发 bus stderr = %q，不应含提示（AC3②）", stderr)
+	}
+
+	// ③ --json：stdout 零污染（合法 JSON 且不含提示文本——机器可读面）+stderr
+	// 仍含提示（stderr 通道，人不因 --json 失去警示）。
+	stdout, stderr = runWantCode(t, "executor_A --json 发 bus", 0, func() int {
+		return runSend(ctx, append(identityArgsAs("executor-C", "executor_A"),
+			"--bus", "--body", "json 形态执行者 bus", "--json", "--mirror-root", root), addr)
+	})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
+		t.Fatalf("--json stdout 非合法 JSON: %v\n%s", err, stdout)
+	}
+	if strings.Contains(stdout, busMisuseHint) {
+		t.Errorf("--json stdout 含提示文本（机器可读面零污染，AC3③）: %q", stdout)
+	}
+	if !strings.Contains(stderr, busMisuseHint) {
+		t.Errorf("--json stderr = %q，期望仍含提示行（提示不因 --json 消失）", stderr)
+	}
+
+	// 边界：非 bus（direct）任何角色零提示——executor_A 定向 controller 成功且
+	// stderr 空（提示只锚 --bus 误用面，direct 本就是提示推荐的正确通道）。
+	_, stderr = runWantCode(t, "executor_A direct", 0, func() int {
+		return runSend(ctx, append(identityArgsAs("executor-A", "executor_A"),
+			"--to-role", "controller", "--body", "执行者定向", "--mirror-root", root), addr)
+	})
+	if stderr != "" {
+		t.Errorf("executor_A direct stderr = %q，期望空（非 bus 零提示）", stderr)
+	}
+}
+
+// TestSendBusHintNotOnLocalFail S1 边界（b2-T4 质量审建议采纳）：buildClient
+// 失败（仓库级 cli.json 损坏，同为退 2 用法类错误）路径 stderr 零提示——提示
+// 位置须在 buildClient 之后，全部本地退 2 路径严格不掺提示行（错误输出单一
+// 焦点）。夹具：chdirForTest 切入临时目录放损坏 .aiteam/cli.json（仓库级查找
+// 链以进程 CWD 为基准，cli_test.go 注：包 CWD 下无该文件不设防，故 chdir 注入）
+// +clearLookupChainEnv 清 env 两级（防机器级 AITEAM_SERVER 污染）+serverOverride
+// 空串走完整五级查找链（非 httptest 注入直胜出）。
+func TestSendBusHintNotOnLocalFail(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".aiteam"), 0o755); err != nil {
+		t.Fatalf("预置 .aiteam 目录失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".aiteam", "cli.json"), []byte("not-json"), 0o644); err != nil {
+		t.Fatalf("预置损坏 cli.json 失败: %v", err)
+	}
+	chdirForTest(t, dir)
+	clearLookupChainEnv(t)
+
+	// executor_A+--bus 触发提示条件，但 buildClient 在 cli.json 级 fail-fast
+	// 退 2（ResolveServer 报「解析配置 … 失败」）——此路径 stderr 不得含提示行。
+	_, stderr := runWantCode(t, "bus+坏 cli.json", 2, func() int {
+		return runSend(context.Background(), append(identityArgsAs("executor-D", "executor_A"),
+			"--bus", "--body", "x", "--mirror-root", t.TempDir()), "")
+	})
+	if !strings.Contains(stderr, "解析配置") {
+		t.Errorf("坏 cli.json stderr = %q，期望含「解析配置」失败文案（fail-fast）", stderr)
+	}
+	if strings.Contains(stderr, "提示：bus 广播") {
+		t.Errorf("坏 cli.json 退 2 路径 stderr = %q，不应含 bus 误用提示（S1：本地退 2 路径零提示）", stderr)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// b4-T1 R1 目标解析预览（b4-spec §二.R1/AC1：--dry-run+发送输出增强）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestSendDryRunPreview AC1①+③(dry-run 半面)：--dry-run 解析目标输出全貌后
+// 不发送。四形态逐一断言恰一行摘要（b4-spec §二.R1 措辞落位，四要素齐全：
+// 项目/栏目/目标格/会话+kind/level）；零落库=真服务夹具下 dry-run 后 #13 全量
+// 零条+镜像零触碰；零网络=死端口下照常 rc=0（若 dry-run 误发请求将得退 3，
+// 实测 0 即证明 buildClient/POST 未达）。解析面=参数可确定信息：chat 的栏目/
+// 角色格、目标域存在性属服务端面——dry-run 不做存在性往返（executor-B 会话
+// 未注册、proj-b 项目未 seed 均照常解析，零网络语义边界；存在性防线由实发
+// 的服务端校验兜底）。
+func TestSendDryRunPreview(t *testing.T) {
+	addr := startRegTestServer(t)
+	ctx := context.Background()
+	dead := closedServerAddr(t)
+	root := t.TempDir() // dry-run 恒零落库：镜像根仅参数面占位
+	dryArgs := func(extra ...string) []string {
+		args := append(regIdentityArgs(), "--body", "x", "--dry-run")
+		args = append(args, extra...)
+		return append(args, "--mirror-root", root)
+	}
+
+	// direct：恰一行摘要+stderr 零输出+messages 零增长+镜像零触碰。
+	stdout, stderr := runWantCode(t, "dry-run direct", 0, func() int {
+		return runSend(ctx, dryArgs("--to-role", "executor", "--level", "block"), addr)
+	})
+	wantDirect := "目标解析：项目 " + regAuthProject + " 栏目 " + regAuthColumn + " → 角色格 executor｜direct + level block"
+	if stdout != wantDirect+"\n" {
+		t.Errorf("dry-run direct stdout = %q，期望恰一行 %q", stdout, wantDirect)
+	}
+	if stderr != "" {
+		t.Errorf("dry-run direct stderr = %q，期望空", stderr)
+	}
+	if msgs := historyProbe(t, addr, regAuthSession, regAuthRole, ""); len(msgs) != 0 {
+		t.Errorf("dry-run 后 messages = %+v，期望 0 条（零落库 AC1①）", msgs)
+	}
+	assertNoMirrorFile(t, sendMirrorPath(root, regAuthProject, regAuthColumn))
+
+	// chat（死端口）：栏目/角色格=目标会话所属（服务端解析面），摘要如实标注；
+	// 会话无需预注册。
+	stdout, stderr = runWantCode(t, "dry-run chat", 0, func() int {
+		return runSend(ctx, dryArgs("--to-session", "executor-B"), dead)
+	})
+	wantChat := "目标解析：项目 " + regAuthProject + " 栏目 会话所属（服务端解析） → 会话 executor-B｜chat + level normal"
+	if stdout != wantChat+"\n" {
+		t.Errorf("dry-run chat stdout = %q，期望恰一行 %q", stdout, wantChat)
+	}
+	if stderr != "" {
+		t.Errorf("dry-run chat stderr = %q，期望空", stderr)
+	}
+
+	// bus（controller 身份，死端口）：项目级广播语义——全栏目→controller 格；
+	// controller 合法受众零 bus 误用提示（b2-R3 判定面在 dry-run 同样生效）。
+	stdout, stderr = runWantCode(t, "dry-run bus", 0, func() int {
+		return runSend(ctx, dryArgs("--bus"), dead)
+	})
+	wantBus := "目标解析：项目 " + regAuthProject + " 栏目 全栏目（项目级广播） → 角色格 controller｜bus + level normal"
+	if stdout != wantBus+"\n" {
+		t.Errorf("dry-run bus stdout = %q，期望恰一行 %q", stdout, wantBus)
+	}
+	if stderr != "" {
+		t.Errorf("dry-run bus stderr = %q，期望空（controller 合法受众零提示）", stderr)
+	}
+
+	// 跨项目 direct（死端口，proj-b 未 seed）：项目段切换为 --to-project 值。
+	stdout, _ = runWantCode(t, "dry-run 跨项目", 0, func() int {
+		return runSend(ctx, dryArgs("--to-project", "proj-b", "--to-role", "executor"), dead)
+	})
+	wantCross := "目标解析：项目 proj-b 栏目 " + regAuthColumn + " → 角色格 executor｜direct + level normal"
+	if stdout != wantCross+"\n" {
+		t.Errorf("dry-run 跨项目 stdout = %q，期望恰一行 %q", stdout, wantCross)
+	}
+
+	// --json（AC1③ dry-run 半面）：输出 resolved_target 对象——direct 键集恰
+	// 五键（session omitempty 缺省，additive 键缺省口径同 pollAckData.acked_to）；
+	// bus 键集恰四键（column/session 缺省+role=controller 唯一投递格）。
+	stdout, _ = runWantCode(t, "dry-run --json", 0, func() int {
+		return runSend(ctx, dryArgs("--to-role", "executor", "--level", "important", "--json"), dead)
+	})
+	assertDryRunJSON(t, stdout, map[string]string{
+		"kind": "direct", "project": regAuthProject, "column": regAuthColumn,
+		"role": "executor", "level": "important",
+	})
+
+	stdout, _ = runWantCode(t, "dry-run --json bus", 0, func() int {
+		return runSend(ctx, dryArgs("--bus", "--json"), dead)
+	})
+	assertDryRunJSON(t, stdout, map[string]string{
+		"kind": "bus", "project": regAuthProject, "role": "controller", "level": "normal",
+	})
+}
+
+// assertDryRunJSON dry-run --json 断言：合法 JSON+键集恰=want（值逐键相等；
+// 不在 want 的键=omitempty 缺省，键数不等即报）。
+func assertDryRunJSON(t *testing.T, stdout string, want map[string]string) {
+	t.Helper()
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
+		t.Fatalf("dry-run --json 非合法 JSON: %v\n%s", err, stdout)
+	}
+	if len(raw) != len(want) {
+		t.Errorf("dry-run --json 键数 = %d（键 %v），期望恰 %d 键（键集 %v）", len(raw), raw, len(want), want)
+	}
+	for k, w := range want {
+		v, ok := raw[k]
+		if !ok {
+			t.Errorf("dry-run --json 缺键 %q（实际键 %v）", k, raw)
+			continue
+		}
+		if got := strings.Trim(string(v), `"`); got != w {
+			t.Errorf("dry-run --json[%q] = %q，期望 %q", k, got, w)
+		}
+	}
+}
+
+// TestSendDryRunMatchesSend AC1④ 解析一致：同参数先 --dry-run（死端口=零网络）
+// 后实发（真服务）——文本面 dry-run 输出与实发摘要行逐字节一致；--json 面
+// dry-run 顶层对象与实发 resolved_target 子对象逐字节一致（同一结构序列化，
+// 分叉即解析面分叉）。取 chat 形态（项目/会话/level 全要素在场，最能暴露
+// 解析分叉）。
+func TestSendDryRunMatchesSend(t *testing.T) {
+	addr := startRegTestServer(t)
+	dead := closedServerAddr(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	historyProbe(t, addr, "executor-B", "executor", "") // 预注册 chat 目标会话（实发半边需要）
+
+	args := func(extra ...string) []string {
+		args := append(regIdentityArgs(),
+			"--to-session", "executor-B", "--level", "important", "--body", "一致性正文",
+			"--mirror-root", root)
+		return append(args, extra...)
+	}
+	dryOut, _ := runWantCode(t, "dry-run 先行", 0, func() int {
+		return runSend(ctx, args("--dry-run"), dead)
+	})
+	sendOut, _ := runWantCode(t, "实发随后", 0, func() int {
+		return runSend(ctx, args(), addr)
+	})
+
+	// 文本面：实发=OK 行+摘要行两行，OK 行可解析（首行）且摘要行与 dry-run
+	// 输出逐字节一致（AC1④ 最强形态：同一渲染函数产出）。
+	seq, ts := parseOKLine(t, sendOut)
+	if seq <= 0 || ts == "" {
+		t.Fatalf("实发 OK 行非法: seq=%d time=%q", seq, ts)
+	}
+	lines := strings.Split(strings.TrimRight(sendOut, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("实发输出应 OK 行+摘要行共 2 行，实际 %q", sendOut)
+	}
+	if dryLine := strings.TrimRight(dryOut, "\n"); lines[1] != dryLine {
+		t.Errorf("摘要分叉（AC1④）：实发 %q ≠ dry-run %q", lines[1], dryLine)
+	}
+
+	// --json 面：实发 resolved_target 子对象 == dry-run 顶层对象（逐字节）。
+	dryJSON, _ := runWantCode(t, "dry-run --json", 0, func() int {
+		return runSend(ctx, args("--dry-run", "--json"), dead)
+	})
+	sendJSON, _ := runWantCode(t, "实发 --json", 0, func() int {
+		return runSend(ctx, args("--json"), addr)
+	})
+	var sendRaw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(sendJSON)), &sendRaw); err != nil {
+		t.Fatalf("实发 --json 非合法 JSON: %v\n%s", err, sendJSON)
+	}
+	rt, ok := sendRaw["resolved_target"]
+	if !ok {
+		t.Fatalf("实发 --json 缺 resolved_target 键（AC1③）: %s", sendJSON)
+	}
+	if string(rt) != strings.TrimSpace(dryJSON) {
+		t.Errorf("resolved_target 分叉（AC1④）：实发 %s ≠ dry-run %s", rt, strings.TrimSpace(dryJSON))
+	}
+}
+
+// TestSendOutputSummary AC1② 默认发送输出增强：`OK seq=N time=...` 行仍在
+// （首行）+追加目标摘要行（同 dry-run 解析面）；stderr 零输出不变；镜像行
+// 不受摘要段影响（§8.2 行格式冻结面在镜像文件——stdout 增强不外溢）。
+func TestSendOutputSummary(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+
+	stdout, stderr := runWantCode(t, "默认 send 输出增强", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-role", "executor", "--level", "block", "--body", "摘要段正文",
+			"--mirror-root", root), addr)
+	})
+	if stderr != "" {
+		t.Errorf("send 成功 stderr = %q，期望空（摘要段进 stdout）", stderr)
+	}
+	seq, ts := parseOKLine(t, stdout)
+	if seq <= 0 || ts == "" {
+		t.Fatalf("OK 行 seq/time 非法: seq=%d time=%q", seq, ts)
+	}
+	want := "目标解析：项目 " + regAuthProject + " 栏目 " + regAuthColumn + " → 角色格 executor｜direct + level block"
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if len(lines) != 2 || lines[1] != want {
+		t.Errorf("send 输出 = %q，期望 OK 行+摘要行（第二行 %q）", stdout, want)
+	}
+	if got := readMirrorLines(t, sendMirrorPath(root, regAuthProject, regAuthColumn)); len(got) != 2 {
+		t.Errorf("镜像 = %q，期望头注释+1 消息行共 2 行（摘要段不进镜像）", got)
+	}
+}
+
+// TestSendJSONResolvedTarget AC1③（实发半面）：--json 恰五键（#9 四键+
+// resolved_target additive）+resolved_target 子对象按形态 omitempty——chat
+// 缺 column/role（服务端解析面）、bus 缺 column/session 且 role=controller
+// （唯一投递格）；值面与目标参数逐项吻合。
+func TestSendJSONResolvedTarget(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	historyProbe(t, addr, "executor-B", "executor", "")
+
+	chatOut, _ := runWantCode(t, "chat --json", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-session", "executor-B", "--level", "important", "--body", "x",
+			"--json", "--mirror-root", root), addr)
+	})
+	assertResolvedTarget(t, chatOut, map[string]string{
+		"kind": "chat", "project": regAuthProject, "session": "executor-B", "level": "important",
+	})
+
+	busOut, _ := runWantCode(t, "bus --json", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--bus", "--body", "x", "--json", "--mirror-root", root), addr)
+	})
+	assertResolvedTarget(t, busOut, map[string]string{
+		"kind": "bus", "project": regAuthProject, "role": "controller", "level": "normal",
+	})
+}
+
+// assertResolvedTarget 实发 --json 断言：顶层恰五键（#9 四键+resolved_target）
+// +resolved_target 子对象键集恰=want（值逐键相等，omitempty 缺省键不在键集）。
+func assertResolvedTarget(t *testing.T, stdout string, want map[string]string) {
+	t.Helper()
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
+		t.Fatalf("send --json 非合法 JSON: %v\n%s", err, stdout)
+	}
+	if len(raw) != 5 {
+		t.Errorf("send --json 键数 = %d（键 %v），期望恰 5 键（#9 四键+resolved_target）", len(raw), raw)
+	}
+	rtRaw, ok := raw["resolved_target"]
+	if !ok {
+		t.Fatalf("send --json 缺 resolved_target 键: %s", stdout)
+	}
+	var rt map[string]string
+	if err := json.Unmarshal(rtRaw, &rt); err != nil {
+		t.Fatalf("resolved_target 非合法 JSON 对象: %v（%s）", err, rtRaw)
+	}
+	if len(rt) != len(want) {
+		t.Errorf("resolved_target 键集 = %v，期望恰 %v（omitempty 缺省键不在场）", rt, want)
+	}
+	for k, w := range want {
+		if rt[k] != w {
+			t.Errorf("resolved_target[%q] = %q，期望 %q", k, rt[k], w)
+		}
+	}
+}
+
+// TestSendDryRunBusHint 裁量留痕（b4 开工令）：dry-run 与实发共用同一 bus 误用
+// 判定——非 controller 发 --bus 的 dry-run 同样 stderr 输出提示行（预览如实：
+// 「这条 bus 执行者格收不到」在预览面就该看到），stdout 摘要照常（警示不拦截
+// 哲学在预览面同构）。位置裁量：dry-run 零网络不经实发面的 buildClient 后置
+// 提示位，判定在 dry-run 出口本地重放；dry-run 无本地退 2 出口（rc=0 成功
+// 输出），不涉 b2-T4/S1「错误输出掺入提示」面——实发面提示位零变化
+// （TestSendBusHintNotOnLocalFail 锚定不破）。
+func TestSendDryRunBusHint(t *testing.T) {
+	dead := closedServerAddr(t)
+	ctx := context.Background()
+
+	stdout, stderr := runWantCode(t, "executor_A dry-run bus", 0, func() int {
+		return runSend(ctx, append(identityArgsAs("executor-E", "executor_A"),
+			"--bus", "--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	if !strings.Contains(stderr, busMisuseHint) {
+		t.Errorf("dry-run bus stderr = %q，期望含提示行（裁量：dry-run 提示与实发一致）", stderr)
+	}
+	if stderr != busMisuseHint+"\n" {
+		t.Errorf("dry-run bus stderr = %q，期望恰一行提示无杂音", stderr)
+	}
+	wantBus := "目标解析：项目 " + regAuthProject + " 栏目 全栏目（项目级广播） → 角色格 controller｜bus + level normal"
+	if stdout != wantBus+"\n" {
+		t.Errorf("dry-run bus stdout = %q，期望恰一行 %q", stdout, wantBus)
+	}
+
+	// controller 半边零提示（判定面同实发：controller 前缀不命中）。
+	_, stderr = runWantCode(t, "controller dry-run bus", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--bus", "--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	if strings.Contains(stderr, "提示：bus 广播") {
+		t.Errorf("controller dry-run bus stderr = %q，不应含提示", stderr)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// b4-T2 R2 --to-session 歧义告警（b4-spec §二.R2/AC2：chat 形态下划线名
+// stderr 告警一行，不拦截）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// sessionAmbiguityHint R2 告警行逐字模板（b4-spec §二.R2 原文锚定，含全角
+// 标点与破折号）。
+const sessionAmbiguityHint = "提示：--to-session 值含下划线，形似角色名（role=executor_<标识>）；会话名惯用连字符——若本意是定向角色格请用 --to-role"
+
+// TestSendSessionAmbiguityHint AC2 四形态+判据边界+dry-run 预览保真：①executor_A
+// 形值触发 stderr 恰一行 spec 原文告警 ②executor-A 连字符惯用形零告警 ③告警
+// 不拦截（发送照常成功 rc=0+seq>0，警示哲学同 M-11/b2-R3）④--json stdout 零
+// 污染（合法 JSON 且不含告警文本）+stderr 仍含告警。判据边界（^[a-z]+_ 前缀
+// 模式，spec 裁量①从简、接受低成本误报）：纯小写无下划线（executora）零告警、
+// controller_A 形同样命中（模式覆盖性——controller_*/executor_* 全在告警面）、
+// 大写形（Executor_A）不命中（判据忠实：^[a-z]+ 锚小写字母前缀）。dry-run 面
+// 同构：歧义名 dry-run 同样告警（预览保真，与 T1 dry-run 面 bus hint 同哲学）
+// ——边界用例走死端口零网络（dry-run 无存在性往返，无需预注册会话）。
+func TestSendSessionAmbiguityHint(t *testing.T) {
+	addr := startRegTestServer(t)
+	root := t.TempDir()
+	ctx := context.Background()
+	dead := closedServerAddr(t)
+	// 预注册 chat 目标会话（实发面①~④需要——chat 目标会话须已注册 §2.2 #9；
+	// executor_A 本身是合法会话名，注册后才有「发送照常成功」可断言）。
+	historyProbe(t, addr, "executor_A", "executor_A", "")
+	historyProbe(t, addr, "executor-A", "executor", "")
+
+	// ① executor_A 形触发+③ 不拦截：rc=0+seq>0（chat 发送本身合法，告警只
+	// 警示）+stderr 恰一行 spec 原文告警（成功路径 stderr 本零输出，告警行=
+	// 唯一 stderr 内容——spec「告警一行」）。
+	stdout, stderr := runWantCode(t, "chat executor_A", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-session", "executor_A", "--body", "歧义名正文", "--mirror-root", root), addr)
+	})
+	if seq, _ := parseOKLine(t, stdout); seq <= 0 {
+		t.Errorf("executor_A chat 应照常成功（告警不拦截，AC2③），stdout = %q", stdout)
+	}
+	if !strings.Contains(stderr, sessionAmbiguityHint) {
+		t.Errorf("executor_A chat stderr = %q，期望含 spec 原文告警行（AC2①）", stderr)
+	}
+	if stderr != sessionAmbiguityHint+"\n" {
+		t.Errorf("executor_A chat stderr = %q，期望恰一行告警无杂音", stderr)
+	}
+
+	// ② executor-A 连字符惯用形：零告警（stderr 空）+照常成功。
+	_, stderr = runWantCode(t, "chat executor-A", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-session", "executor-A", "--body", "连字符正文", "--mirror-root", root), addr)
+	})
+	if stderr != "" {
+		t.Errorf("executor-A chat stderr = %q，期望空（连字符惯用形零告警，AC2②）", stderr)
+	}
+
+	// ④ --json：stdout 零污染（合法 JSON 且不含告警文本——机器可读面）+stderr
+	// 仍含告警（告警面向人不因 --json 消失）。
+	stdout, stderr = runWantCode(t, "chat executor_A --json", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(),
+			"--to-session", "executor_A", "--body", "json 形态歧义名", "--json",
+			"--mirror-root", root), addr)
+	})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
+		t.Fatalf("--json stdout 非合法 JSON: %v\n%s", err, stdout)
+	}
+	if strings.Contains(stdout, sessionAmbiguityHint) {
+		t.Errorf("--json stdout 含告警文本（机器可读面零污染，AC2④）: %q", stdout)
+	}
+	if !strings.Contains(stderr, sessionAmbiguityHint) {
+		t.Errorf("--json stderr = %q，期望仍含告警行（告警不因 --json 消失）", stderr)
+	}
+
+	// 边界①：纯小写无下划线（executora）零告警——模式要求下划线。
+	_, stderr = runWantCode(t, "dry-run executora", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(), "--to-session", "executora",
+			"--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	if strings.Contains(stderr, sessionAmbiguityHint) {
+		t.Errorf("executora dry-run stderr = %q，不应含告警（无下划线不命中 ^[a-z]+_）", stderr)
+	}
+
+	// 边界②：controller_A 形同样命中（模式覆盖性——判据不偏袒 executor 族）。
+	_, stderr = runWantCode(t, "dry-run controller_A", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(), "--to-session", "controller_A",
+			"--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	if !strings.Contains(stderr, sessionAmbiguityHint) {
+		t.Errorf("controller_A dry-run stderr = %q，期望含告警（controller_* 形同命中模式）", stderr)
+	}
+
+	// 边界③：大写形（Executor_A）不命中（判据忠实：^[a-z]+ 锚小写字母前缀，
+	// 大写起头非本告警面）。
+	_, stderr = runWantCode(t, "dry-run Executor_A", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(), "--to-session", "Executor_A",
+			"--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	if strings.Contains(stderr, sessionAmbiguityHint) {
+		t.Errorf("Executor_A dry-run stderr = %q，不应含告警（大写形不命中 ^[a-z]+_）", stderr)
+	}
+
+	// dry-run 面主断言（预览保真）：歧义名 dry-run 同样输出告警（stdout 摘要
+	// 照常+stderr 恰一行告警——「这个会话名形似角色名」在预览面就该看到，
+	// 与 T1 dry-run 面 bus hint 同哲学）。死端口=dry-run 零网络语义同时覆盖。
+	stdout, stderr = runWantCode(t, "dry-run executor_A", 0, func() int {
+		return runSend(ctx, append(regIdentityArgs(), "--to-session", "executor_A",
+			"--body", "x", "--dry-run", "--mirror-root", t.TempDir()), dead)
+	})
+	wantChat := "目标解析：项目 " + regAuthProject + " 栏目 会话所属（服务端解析） → 会话 executor_A｜chat + level normal"
+	if stdout != wantChat+"\n" {
+		t.Errorf("dry-run executor_A stdout = %q，期望恰一行 %q", stdout, wantChat)
+	}
+	if stderr != sessionAmbiguityHint+"\n" {
+		t.Errorf("dry-run executor_A stderr = %q，期望恰一行告警（dry-run 告警与实发一致）", stderr)
+	}
+}
+
+// TestNoMirror --no-mirror 与 --json：跳过双写不落文件；--json 键面=#9 四键
+// +resolved_target（b4-T1 additive，恰五键）。
 func TestNoMirror(t *testing.T) {
 	addr := startRegTestServer(t)
 	root := t.TempDir()
@@ -591,7 +1161,8 @@ func TestNoMirror(t *testing.T) {
 	}
 	assertNoMirrorFile(t, sendMirrorPath(root, regAuthProject, regAuthColumn))
 
-	// --json：恰四键同构 + 字段值正确；默认双写照常（--json 不影响镜像）。
+	// --json：恰五键（#9 四键+resolved_target additive，b4-T1 豁免面更新）+
+	// 字段值正确；默认双写照常（--json 不影响镜像）。
 	stdout, _ = runWantCode(t, "--json", 0, func() int {
 		return runSend(ctx, append(regIdentityArgs(),
 			"--to-role", "executor", "--level", "important", "--body", "json 输出",
@@ -601,12 +1172,12 @@ func TestNoMirror(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &raw); err != nil {
 		t.Fatalf("--json 输出非合法 JSON: %v\n%s", err, stdout)
 	}
-	if len(raw) != 4 {
-		t.Errorf("--json 键数 = %d，期望恰 4 键与 #9 响应同构（实际键 %v）", len(raw), raw)
+	if len(raw) != 5 {
+		t.Errorf("--json 键数 = %d，期望恰 5 键（#9 四键+resolved_target，b4-T1 additive）（实际键 %v）", len(raw), raw)
 	}
-	for _, k := range []string{"seq", "created_at", "level", "kind"} {
+	for _, k := range []string{"seq", "created_at", "level", "kind", "resolved_target"} {
 		if _, ok := raw[k]; !ok {
-			t.Errorf("--json 缺键 %q（#9 响应同构）", k)
+			t.Errorf("--json 缺键 %q", k)
 		}
 	}
 	var parsed struct {

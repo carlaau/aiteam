@@ -174,12 +174,14 @@ func TestBackupConsistency(t *testing.T) {
 		t.Fatalf("backup 失败: %v", runErr)
 	}
 
-	// 成功输出格式（§D6 行为规格）：OK backup=<path> tables=11
-	if !strings.HasPrefix(out, "OK backup=") || !strings.Contains(out, "tables=11") {
-		t.Errorf("stdout = %q，期望前缀 OK backup= 且含 tables=11", out)
+	// 成功输出格式（§D6 行为规格）：OK backup=<path> tables=<用户表数>——
+	// 字面 12=b5-T1 迁移 v4 增补 recalled_messages 后的用户表总数（锚随迁移
+	// 刷新，b5-T1 报备；输出本体=运行时实数非硬编码）。
+	if !strings.HasPrefix(out, "OK backup=") || !strings.Contains(out, "tables=12") {
+		t.Errorf("stdout = %q，期望前缀 OK backup= 且含 tables=12", out)
 	}
 
-	// 产物独立可开：十表齐（表名单 wantServeTables 与 schema.sql 同源）
+	// 产物独立可开：全表齐（表名单 wantServeTables 与 schema.sql 同源）
 	assertTablesComplete(t, outPath)
 	if uv := userVersionOf(t, outPath); uv != store.SchemaVersion() {
 		t.Errorf("产物 user_version = %d，期望 = store.SchemaVersion() %d", uv, store.SchemaVersion())
@@ -458,7 +460,7 @@ func TestBackupPathResolution(t *testing.T) {
 // backup 探测 CWD 的 aiteam-config.json（备份对象=正在服务的库，同源原则；序 9
 // 拍平起 serve 改 exe 目录基准，backup 维护命令保持 CWD 语义）。实证缺陷原貌：
 // serve 用自定义 db.path=custom.db 服务时，无参 backup 静默备份内建默认库
-// （空库 tables=11 假绿），恢复四步把空库拷回=现场清零实害。
+// （空库 tables=12 假绿，b5-T1 起含墓碑表），恢复四步把空库拷回=现场清零实害。
 func TestBackupCWDProbe(t *testing.T) {
 	t.Run("CWD配置含自定义db.path备对库且明示source", func(t *testing.T) {
 		dir := t.TempDir()
@@ -470,8 +472,8 @@ func TestBackupCWDProbe(t *testing.T) {
 			t.Fatalf("写 CWD 配置文件失败: %v", err)
 		}
 		want := seedDBFile(t, "custom.db") // 相对 CWD
-		// 干扰项：内建默认路径 db/aiteam.db 预置一张 11 表空库（复刻实证缺陷现场）——
-		// 若实现退回旧行为备了它，tables=11 照样成立（假绿）但夹具行数全 0，行数断言必炸
+		// 干扰项：内建默认路径 db/aiteam.db 预置一张 12 表空库（复刻实证缺陷现场）——
+		// 若实现退回旧行为备了它，tables=12 照样成立（假绿）但夹具行数全 0，行数断言必炸
 		if err := os.MkdirAll("db", 0o755); err != nil {
 			t.Fatalf("建默认库目录失败: %v", err)
 		}
@@ -497,8 +499,8 @@ func TestBackupCWDProbe(t *testing.T) {
 		if !strings.Contains(out, "source=custom.db") {
 			t.Errorf("stdout = %q，期望含 source=custom.db（探测命中自定义 db.path 须明示实际源库）", out)
 		}
-		if !strings.HasPrefix(out, "OK backup=") || !strings.Contains(out, "tables=11") {
-			t.Errorf("stdout = %q，期望前缀 OK backup= 且含 tables=11（既有输出契约不被破坏）", out)
+		if !strings.HasPrefix(out, "OK backup=") || !strings.Contains(out, "tables=12") {
+			t.Errorf("stdout = %q，期望前缀 OK backup= 且含 tables=12（既有输出契约不被破坏）", out)
 		}
 	})
 

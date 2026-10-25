@@ -145,6 +145,32 @@ func (s *Server) handleColumnArchive(w http.ResponseWriter, r *http.Request) {
 	types.WriteData(w, http.StatusOK, archiveData{Status: store.ColumnStatusArchived})
 }
 
+// ---- M-31 POST /api/v1/projects/{code}/columns/{col}/unarchive ----
+
+// handleColumnUnarchive 反归档端点（M-31，#7 archive 的逆动词）：响应恰
+// {status:"active"}；反归档+审计同事务（UnarchiveColumnWithAudit——§七 往返账
+// 同 update/archive）；位点/历史保留可查；幂等重放照常留痕且 detail 记真实前态。
+func (s *Server) handleColumnUnarchive(w http.ResponseWriter, r *http.Request) {
+	projectCode, colCode := r.PathValue("code"), r.PathValue("col")
+	if _, err := s.st.UnarchiveColumnWithAudit(projectCode, colCode,
+		store.AuditEntry{
+			Action:    store.AuditColumnUnarchive,
+			SessionID: sessionIDFromCtx(r.Context()),
+		},
+		// detail 快照在事务内拿到 before 真实行后生成（store 回调）。
+		func(before store.Column) string {
+			return auditDetailJSON(statusFlow{
+				Before: statusSnapshot{Status: before.Status},
+				After:  statusSnapshot{Status: store.ColumnStatusActive},
+			})
+		},
+	); err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	types.WriteData(w, http.StatusOK, archiveData{Status: store.ColumnStatusActive})
+}
+
 // ---- #8 GET /api/v1/projects/{code}/columns ----
 
 // columnListData 端点 #8 响应 data（元素同 #5 字段面）。

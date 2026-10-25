@@ -15,7 +15,7 @@ AI 会话开工第一动作=读 `.aiteam/onboarding.md`（服务地址/身份四
 
 ```
 cmd/aiteam/          入口 main
-internal/server/     HTTP 服务+看板路由（32 端点）
+internal/server/     HTTP 服务+看板路由（35 端点）
 internal/store/      SQLite 存储层（schema.sql embed）
 internal/cli/        CLI 命令族（send/poll/ack/status/watch/init/progress...）
 internal/client/     HTTP 客户端封装
@@ -39,5 +39,5 @@ dist/                构建产物（gitignore，本地构建生成）
 <!-- aiteam:begin (do not edit between these markers) -->
 ## aiteam 多会话通讯接入
 
-本项目使用 aiteam 多会话通讯：AI 会话开工第一动作=读 `.aiteam/onboarding.md`（服务地址/身份四参/五命令/哨兵值守纪律）。
+本项目使用 aiteam 多会话通讯（**独立 CLI**，非任何其他工具的子命令）：命令一律 `~/.aiteam/aiteam <cmd>` 绝对路径裸跑（或 `AITEAM_BIN` 环境变量 / PATH 探测），**勿给 aiteam 加任何前缀**。AI 会话开工第一动作=读 `.aiteam/onboarding.md`（服务地址/身份四参/五命令/哨兵值守纪律）。
 <!-- aiteam:end -->

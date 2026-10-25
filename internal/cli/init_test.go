@@ -194,9 +194,10 @@ func TestInitIdempotent(t *testing.T) {
 	}
 }
 
-// assertOneLinerBlock b9 一句话区块形态断言（AC1）：标记对+一句话引导——含
-// .aiteam/onboarding.md 引导路径；大区块旧正文零残留（接入小节/哨兵纪律正文/
-// planning 指针/官方链接行——正文唯一源收敛在 onboarding.md，区块恒定）。
+// assertOneLinerBlock aiteam 接入区块形态断言（b9 AC1 骨架+b3 R2 换文版文本）：
+// 标记对+接入引导两句（用户指定版，逐字锚在下方 want 表）——含 .aiteam/onboarding.md
+// 引导路径；大区块旧正文零残留（接入小节/哨兵纪律正文/planning 指针/官方链接行
+// ——正文唯一源收敛在 onboarding.md，区块文案随版本演进经 markerBlock 刷新）。
 func assertOneLinerBlock(t *testing.T, agents string) {
 	t.Helper()
 	begin := "<!-- aiteam:begin (do not edit between these markers) -->"
@@ -204,13 +205,24 @@ func assertOneLinerBlock(t *testing.T, agents string) {
 	if !strings.Contains(agents, begin) || !strings.Contains(agents, end) {
 		t.Errorf("缺 aiteam 标记对（begin/end）:\n%s", agents)
 	}
+	// b3 R2 换文版文本锚（字面量断言防实现侧常量漂移自证，同 topoBegin 惯例）：
+	// 标题行+正文两句逐字=用户指定版——独立 CLI 口径、防前缀误用、开工第一读。
+	for _, want := range []string{
+		"## aiteam 多会话通讯接入",
+		"本项目使用 aiteam 多会话通讯（**独立 CLI**，非任何其他工具的子命令）：命令一律 `~/.aiteam/aiteam <cmd>` 绝对路径裸跑（或 `AITEAM_BIN` 环境变量 / PATH 探测），**勿给 aiteam 加任何前缀**。",
+		"AI 会话开工第一动作=读 `.aiteam/onboarding.md`（服务地址/身份四参/五命令/哨兵值守纪律）。",
+	} {
+		if !strings.Contains(agents, want) {
+			t.Errorf("区块缺用户指定版文本片段（b3 R2 换文）%q:\n%s", want, agents)
+		}
+	}
 	if !strings.Contains(agents, ".aiteam/onboarding.md") {
 		t.Errorf("区块缺 .aiteam/onboarding.md 引导路径（AC1）:\n%s", agents)
 	}
 	for _, banned := range []string{
-		"### ",                             // 大区块小节头（接入/开工第一读/铁律/哨兵）——一句话形态无小节
+		"### ",                             // 大区块小节头（接入/开工第一读/铁律/哨兵）——接入区块无小节
 		"docs/planning/",                   // planning 指针（方法论域引用不进通讯区块）
-		"`send`",                           // 五命令正文（一句话只留指针词）
+		"`send`",                           // 五命令正文（区块正文不展开命令）
 		"纯传呼机",                             // 哨兵纪律正文
 		"docs/接入指南.md",                     // 官方指引行（收敛进 onboarding.md）
 		"禁止 push", "git add", "中文 message", // 铁律旧条文（b6 W1/R2 清退，防回归）
@@ -218,13 +230,13 @@ func assertOneLinerBlock(t *testing.T, agents string) {
 		"executor_<标识>", // 身份规约正文
 	} {
 		if strings.Contains(agents, banned) {
-			t.Errorf("区块含一句话形态不应有的内容 %q（AC1：正文收敛 onboarding.md）:\n%s", banned, agents)
+			t.Errorf("区块含不应有的旧正文 %q（AC1：正文收敛 onboarding.md）:\n%s", banned, agents)
 		}
 	}
 }
 
-// TestAgentsBlockThreeStates AGENTS.md 区块管理三态（b9 一句话区块下语义重定义：
-// 区块内容恒定，断言聚焦三态机制本身）：
+// TestAgentsBlockThreeStates AGENTS.md 区块管理三态（b9 引入自管区块、b3 换文版
+// 文案随刷新传播；断言聚焦三态机制本身）：
 // ①无文件→新建含标记；②已存在无标记→用户内容逐字保留+区块末尾追加；
 // ③已存在含标记→区块内刷新、区块外哨兵逐字不动；畸形标记→报错且原文不写回。
 func TestAgentsBlockThreeStates(t *testing.T) {
@@ -276,12 +288,12 @@ func TestAgentsBlockThreeStates(t *testing.T) {
 		t.Errorf("态③旧区块内容未刷新:\n%s", agents3)
 	}
 	if !strings.Contains(agents3, ".aiteam/onboarding.md") {
-		t.Errorf("态③区块内应刷新为一句话引导形态（onboarding.md 引导路径）:\n%s", agents3)
+		t.Errorf("态③区块内应刷新为接入引导文案（onboarding.md 引导路径）:\n%s", agents3)
 	}
 	if strings.Count(agents3, begin) != 1 || strings.Count(agents3, end) != 1 {
 		t.Errorf("态③标记应恰好各一处:\n%s", agents3)
 	}
-	// 态③刷新后新区块为一句话形态（b9：区块演进随刷新传播）。
+	// 态③刷新后新区块为换文版文案（b3：区块演进随刷新传播）。
 	assertOneLinerBlock(t, agents3)
 
 	// 边界回归（b7b-7 质量审查）：半截/逆序标记三种畸形——runInit 必须报错
@@ -935,7 +947,7 @@ func TestHookSilentFail(t *testing.T) {
 }
 
 // TestInitCommOnlyArtifactSurface --comm-only 产物面（#17 小批派工·FX 断点⑥；
-// b9 AC4 四件）：AGENTS.md（一句话区块）+.aiteam/cli.json+CLAUDE.md（同款区块）+
+// b9 AC4 四件）：AGENTS.md（接入区块）+.aiteam/cli.json+CLAUDE.md（同款区块）+
 // .aiteam/onboarding.md（b9 通讯域全集，两形态同款）四件在；planning 渲染件+
 // _template 模板全套/dev-guide/skills 零新增（docs/planning 目录不存在）；二跑增量幂等零变更。
 // 全装对照=既有 TestInit* 全套用例（不带 --comm-only 即全装形态，planning 在位
@@ -944,7 +956,7 @@ func TestInitCommOnlyArtifactSurface(t *testing.T) {
 	dir := t.TempDir()
 	out := runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目", "--comm-only")
 
-	// 通讯四件在位：AGENTS/CLAUDE 一句话区块+cli.json+onboarding 产物。
+	// 通讯四件在位：AGENTS/CLAUDE 接入区块+cli.json+onboarding 产物。
 	agents := readProjectFile(t, dir, "AGENTS.md")
 	assertOneLinerBlock(t, agents)
 	readProjectFile(t, dir, ".aiteam/cli.json")
@@ -975,14 +987,14 @@ func TestInitCommOnlyArtifactSurface(t *testing.T) {
 	}
 }
 
-// ---------- b9 一句话区块：形态恒定性+接线面（语义承接 b6 W1/W2/W5 断言面；
-// b6 的形态分支/哨兵纪律节/官方指引行断言随大区块收敛 onboarding.md 清退，
-// 旧条文回归探测并入 assertOneLinerBlock 禁词表） ----------
+// ---------- b9 自管区块（b3 R2 换文版文案）：形态断言+接线面（语义承接 b6
+// W1/W2/W5 断言面；b6 的形态分支/哨兵纪律节/官方指引行断言随大区块收敛
+// onboarding.md 清退，旧条文回归探测并入 assertOneLinerBlock 禁词表） ----------
 
-// TestAgentsBlockOneLiner 渲染函数级：agentsBlock 一句话形态恒定性——输出与
-// project/name 参数无关（b9：区块恒定不随项目/版本变化，commOnly 形态参数已删，
-// 语义承接原 TestAgentsBlockCommOnlyShape 的两形态断言），标记对+onboarding.md
-// 引导路径在位，大区块旧正文零残留（AC1）。
+// TestAgentsBlockOneLiner 渲染函数级：agentsBlock 文案恒定性——输出与
+// project/name 参数无关（b9：commOnly 形态参数已删，语义承接原
+// TestAgentsBlockCommOnlyShape 的两形态断言；b3：文案随版本演进，渲染函数
+// 不感知版本），标记对+onboarding.md 引导路径在位，大区块旧正文零残留（AC1）。
 func TestAgentsBlockOneLiner(t *testing.T) {
 	block := agentsBlock("proj-a", "示例项目")
 	assertOneLinerBlock(t, block)
@@ -992,8 +1004,8 @@ func TestAgentsBlockOneLiner(t *testing.T) {
 }
 
 // TestInitCommOnlyBlockNoiseZero 接线面：--comm-only 落盘的 AGENTS.md 全文无
-// docs/planning/ 断链引用+一句话形态（含旧条文回归探测）——验证 runInit 真实
-// 落盘形态，非仅渲染函数单测；CLAUDE.md 双写同款一句话区块（b9 W2④）。
+// docs/planning/ 断链引用+接入区块形态（含旧条文回归探测）——验证 runInit 真实
+// 落盘形态，非仅渲染函数单测；CLAUDE.md 双写同款接入区块（b9 W2④）。
 func TestInitCommOnlyBlockNoiseZero(t *testing.T) {
 	dir := t.TempDir()
 	runInitForTest(t, dir, "--project", "proj-a", "--name", "示例项目", "--comm-only")
@@ -1006,7 +1018,7 @@ func TestInitCommOnlyBlockNoiseZero(t *testing.T) {
 }
 
 // TestInitFullFormBlockNoiseZero 完整形态接线面：全装 AGENTS.md/CLAUDE.md 同款
-// 一句话区块（b9：planning 指向清退出区块，方法论入口归 onboarding.md 与
+// 接入区块（b9：planning 指向清退出区块，方法论入口归 onboarding.md 与
 // docs/planning/methodology.md，指向正确性由 TestInitProductTreeEnglish 树断言覆盖）。
 func TestInitFullFormBlockNoiseZero(t *testing.T) {
 	dir := t.TempDir()
@@ -1016,7 +1028,7 @@ func TestInitFullFormBlockNoiseZero(t *testing.T) {
 }
 
 // TestInitCLAUDELegacyPointerMigration b6→b9 升级迁移面：b6 旧版 CLAUDE.md（无标记
-// 指针行，writeIfAbsent 产物）重跑 b9 init——指针行精确移除+一句话区块落位（态②
+// 指针行，writeIfAbsent 产物）重跑新版 init——指针行精确移除+接入区块落位（态②
 // 迁移）；指针行与用户内容并存时仅指针行消失、用户内容逐字保留（态②乙）；重跑
 // 幂等（态③零变更）。断言用字面量防实现侧常量漂移自证（同 topoBegin 惯例）。
 func TestInitCLAUDELegacyPointerMigration(t *testing.T) {

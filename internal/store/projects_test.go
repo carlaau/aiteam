@@ -543,3 +543,145 @@ func TestArchiveProjectWithAudit(t *testing.T) {
 		t.Errorf("回滚后 p-b status = %v（err=%v），期望保持 active", p, err)
 	}
 }
+
+// ---- UnarchiveProject / UnarchiveProjectWithAudit（M-31：镜像 archive 对称纯新增） ----
+
+// TestUnarchiveProject AC1①②③（M-31）：archived→active 刷 updated_at；重复
+// unarchive 幂等成功且不刷 updated_at（§2.1 CASE 幂等语义镜像 projectArchiveSQL）；
+// 目标不存在返回哨兵 ErrProjectNotFound。
+func TestUnarchiveProject(t *testing.T) {
+	s := openTemp(t)
+	seedProject(t, s, "p-a", "项目A", ProjectStatusArchived, 900, "2026-01-01T00:00:00Z")
+	seedProject(t, s, "p-act", "本就活跃", ProjectStatusActive, 900, "2026-01-01T00:01:00Z")
+
+	// ① 首次 unarchive：status 流转 archived→active + updated_at 刷新。
+	const t1 = "2026-01-02T08:00:00Z"
+	injectFixedClock(t, t1)
+	if err := s.UnarchiveProject("p-a"); err != nil {
+		t.Fatalf("UnarchiveProject(p-a) 失败: %v", err)
+	}
+	got, err := s.GetProjectByCode("p-a")
+	if err != nil {
+		t.Fatalf("unarchive 后读取失败: %v", err)
+	}
+	if got.Status != ProjectStatusActive {
+		t.Errorf("status = %q，期望 %q", got.Status, ProjectStatusActive)
+	}
+	assertUpdateStamp(t, got, "2026-01-01T00:00:00Z", t1)
+
+	// ② 已 active 再 unarchive：幂等成功，且 updated_at 不刷新（换新时钟证明无副作用）。
+	const t2 = "2026-01-03T08:00:00Z"
+	injectFixedClock(t, t2)
+	if err := s.UnarchiveProject("p-a"); err != nil {
+		t.Fatalf("重复 UnarchiveProject 应幂等成功，实际: %v", err)
+	}
+	got, err = s.GetProjectByCode("p-a")
+	if err != nil {
+		t.Fatalf("重复 unarchive 后读取失败: %v", err)
+	}
+	if got.UpdatedAt != t1 {
+		t.Errorf("重复 unarchive 不应刷 updated_at：= %q，期望保持 %q", got.UpdatedAt, t1)
+	}
+
+	// 对本就 active 的夹具行 unarchive：同样幂等成功。
+	if err := s.UnarchiveProject("p-act"); err != nil {
+		t.Fatalf("对 active 行 UnarchiveProject 应幂等成功，实际: %v", err)
+	}
+
+	// ③ 目标不存在 → ErrProjectNotFound。
+	if err := s.UnarchiveProject("nope"); !errors.Is(err, ErrProjectNotFound) {
+		t.Errorf("unarchive 不存在项目错误 = %v，期望哨兵 ErrProjectNotFound", err)
+	}
+}
+
+// TestUnarchiveProjectWithAudit AC1①②③④（M-31，镜像 TestArchiveProjectWithAudit）：
+// 反归档+审计同事务——真实前态入快照、幂等重放照常留痕且 before=active 诚实入
+// 快照且 updated_at 不刷、目标不存在 404 无审计、action 空回滚 status 不变。
+func TestUnarchiveProjectWithAudit(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-01-01T08:00:00Z"
+	injectFixedClock(t, t0)
+	seedProject(t, s, "p-a", "项目A", ProjectStatusArchived, 900, "2026-01-01T00:00:00Z")
+
+	detailFn := func(before Project) string {
+		return `{"was":"` + before.Status + `"}`
+	}
+	// ① 反归档：status 流转 + updated_at 刷新 + 审计落库（action/弱关联/前态快照）。
+	const t1 = "2026-01-02T08:00:00Z"
+	injectFixedClock(t, t1)
+	e, err := s.UnarchiveProjectWithAudit("p-a",
+		AuditEntry{Action: AuditProjectUnarchive, SessionID: 4}, detailFn)
+	if err != nil {
+		t.Fatalf("UnarchiveProjectWithAudit 失败: %v", err)
+	}
+	if e.ID <= 0 || e.Detail != `{"was":"archived"}` {
+		t.Errorf("审计 = %+v，期望 id>0 且 detail 记真实前态 archived", e)
+	}
+	if e.Action != AuditProjectUnarchive || e.SessionID != 4 {
+		t.Errorf("审计 action/session_id = %q/%d，期望原样落库 %q/4", e.Action, e.SessionID, AuditProjectUnarchive)
+	}
+	if e.CreatedAt != t1 {
+		t.Errorf("审计 created_at = %q，期望注入时钟 %q（AC1.4 同口径）", e.CreatedAt, t1)
+	}
+	p, err := s.GetProjectByCode("p-a")
+	if err != nil {
+		t.Fatalf("反归档后读取失败: %v", err)
+	}
+	if p.Status != ProjectStatusActive {
+		t.Fatalf("反归档后 status = %q，期望 %q", p.Status, ProjectStatusActive)
+	}
+	if p.UpdatedAt != t1 {
+		t.Errorf("反归档后 updated_at = %q，期望刷新为注入时钟 %q", p.UpdatedAt, t1)
+	}
+	if e.ProjectID != p.ID {
+		t.Errorf("审计 project_id = %d，期望回填项目 id %d", e.ProjectID, p.ID)
+	}
+	if n := countRows(t, s, "audit_log"); n != 1 {
+		t.Errorf("audit_log 行数 = %d，期望 1", n)
+	}
+
+	// ② 幂等重放：再 unarchive 成功，before.Status=active 诚实入快照，审计照落，
+	// updated_at 不刷新（镜像 archive 往返账「重放留痕记真实前态」口径）。
+	const t2 = "2026-01-03T08:00:00Z"
+	injectFixedClock(t, t2)
+	e2, err := s.UnarchiveProjectWithAudit("p-a",
+		AuditEntry{Action: AuditProjectUnarchive}, detailFn)
+	if err != nil {
+		t.Fatalf("幂等重放失败: %v", err)
+	}
+	if e2.Detail != `{"was":"active"}` {
+		t.Errorf("重放审计 detail = %q，期望 {\"was\":\"active\"}（真实前态）", e2.Detail)
+	}
+	p, err = s.GetProjectByCode("p-a")
+	if err != nil {
+		t.Fatalf("重放后读取失败: %v", err)
+	}
+	if p.UpdatedAt != t1 {
+		t.Errorf("重放不应刷 updated_at：= %q，期望保持 %q", p.UpdatedAt, t1)
+	}
+	if n := countRows(t, s, "audit_log"); n != 2 {
+		t.Errorf("audit_log 行数 = %d，期望 2（动作发生即留痕）", n)
+	}
+
+	// ③ 目标不存在 → ErrProjectNotFound，无审计。
+	if _, err := s.UnarchiveProjectWithAudit("nope",
+		AuditEntry{Action: AuditProjectUnarchive}, detailFn); !errors.Is(err, ErrProjectNotFound) {
+		t.Errorf("目标不存在错误 = %v，期望 ErrProjectNotFound", err)
+	}
+	if n := countRows(t, s, "audit_log"); n != 2 {
+		t.Errorf("404 后 audit_log 行数 = %d，期望仍 2", n)
+	}
+
+	// ④ 原子性：action 空 → 回滚，status 不变（另一 archived 项目验证）。
+	seedProject(t, s, "p-b", "项目B", ProjectStatusArchived, 900, "2026-01-01T00:01:00Z")
+	if _, err := s.UnarchiveProjectWithAudit("p-b",
+		AuditEntry{Action: " "}, detailFn); !errors.Is(err, ErrAuditInvalid) {
+		t.Fatalf("action 空 → 错误 = %v，期望 ErrAuditInvalid", err)
+	}
+	if p, err := s.GetProjectByCode("p-b"); err != nil || p.Status != ProjectStatusArchived {
+		t.Errorf("回滚后 p-b status = %v（err=%v），期望保持 archived", p, err)
+	}
+	if n := countRows(t, s, "audit_log"); n != 2 {
+		t.Errorf("回滚后 audit_log 行数 = %d，期望仍 2", n)
+	}
+}

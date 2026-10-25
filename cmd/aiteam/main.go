@@ -40,6 +40,10 @@ func main() {
 	case "history":
 		// §4.6 辅助：history（#13 通用历史查询，含回执状态列）
 		os.Exit(cli.RunHistory(os.Args[2:]))
+	case "recall":
+		// b5 撤回（b5-T3，b5-spec §二.R4）：未消费窗口消息撤回（端点 35），
+		// 404/409 服务端文案透传，退出码映射在 cli 内完成（§4.7）
+		os.Exit(cli.RunRecall(os.Args[2:]))
 	case "project":
 		// §4.3 登记组 project 族（B1-8）：退出码映射在 cli 组入口内完成（§4.7）
 		os.Exit(cli.RunProjectGroup(os.Args[2:]))
@@ -133,8 +137,9 @@ func usage() {
   poll      拉取信箱与对话（五核心，B2 范围）
   ack       推进消费位点+block 回执（五核心，B2 范围）
   history   通用历史查询（B2 范围）
-  project   登记组 project 族 <register|update|archive|list>（B1 范围）
-  column    登记组 column 族 <register|update|archive|list>（B1 范围）
+  recall    撤回未消费消息 --seq <n> [--reason <文本>]（b5 范围）
+  project   登记组 project 族 <register|update|archive|unarchive|list>（B1 范围）
+  column    登记组 column 族 <register|update|archive|unarchive|list>（B1 范围）
   session   会话心跳面 <list>（B1 范围）
   audit     审计留痕查询（B1 范围）
   progress  进度上报 <上报|list>（FR23：手动层 --batch/--task，hook 自动层 --commit/--branch）

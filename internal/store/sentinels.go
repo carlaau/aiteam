@@ -422,6 +422,11 @@ const chatConsumerPrefix = "chat:session:"
 // ②位点缺行语义相反（本 SQL 全量可见 vs 惰性初始化不回看），互换即行为回归；
 // ③位点子查询内联保持单条往返，拆链变两查。谓词三分支与 §3.6/B2 pollVisibleSQL
 // 逐字同源，双路径显式登记非静默。
+//
+// b5-T6 分歧登记（终审建议①）：b5-T1 起 pollVisibleSQL 三分支追加 NOT EXISTS
+// recalled_messages 墓碑过滤，本查询**不含**——watch 命中面对已撤消息仍按元数据
+// 命中（seq/level/kind/target_role，Hit 无 body 字段零正文外泄）；无害：位点只进
+// 不退，命中幽灵随该 seq 被 ack 后消散，行为零变化是 b5 红线要求。
 const pollHitsSQL = `
 SELECT m.seq, m.level, m.kind, m.target_role
 FROM messages m

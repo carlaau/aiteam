@@ -358,3 +358,48 @@ func TestWebResponsiveDarkGates(t *testing.T) {
 		}
 	}
 }
+
+// TestWebRecallTombstoneAnchors b5-T4/AC3②③ 看板面源码锚（白名单测试同款源码
+// 扫描裁量——本仓看板 JS 无 DOM 测试基建，真实渲染行为冒烟走查兜底）：对话页
+// （dialog.js）与总线流（app.js）对 recalled=true 行渲染占位行「消息已由发送方
+// 撤回」不渲染正文；占位样式类灰化斜体、只用既有 CSS 变量（亮暗两主题级联自动
+// 覆盖，闸④禁裸色值同款约束）。
+func TestWebRecallTombstoneAnchors(t *testing.T) {
+	h := newTestServer(t)
+	get := func(path string) string {
+		rr := doReq(t, h, http.MethodGet, path, nil)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d，期望 200", path, rr.Code)
+		}
+		return rr.Body.String()
+	}
+	dialogJS := get("/dialog.js")
+	for _, anchor := range []string{
+		"recalled",             // 墓碑标记守卫键（wire recalled:true 消费面）
+		"消息已由发送方撤回",            // 占位行文案（b5-spec R5 冻结措辞）
+		"recalled-placeholder", // 占位样式类
+	} {
+		if !strings.Contains(dialogJS, anchor) {
+			t.Errorf("dialog.js 缺撤回占位锚 %q（b5-T4 对话页墓碑行）", anchor)
+		}
+	}
+	appJS := get("/app.js")
+	for _, anchor := range []string{
+		"recalled",             // 总线流墓碑守卫（#26 走统一读面，契约兜底分支）
+		"消息已由发送方撤回",            // 占位行文案
+		"recalled-placeholder", // 占位样式类
+	} {
+		if !strings.Contains(appJS, anchor) {
+			t.Errorf("app.js 缺撤回占位锚 %q（b5-T4 总线流墓碑行）", anchor)
+		}
+	}
+	css := get("/style.css")
+	for _, anchor := range []string{
+		".recalled-placeholder", // 占位样式类本体
+		"font-style: italic",    // 低调斜体
+	} {
+		if !strings.Contains(css, anchor) {
+			t.Errorf("style.css 缺撤回占位锚 %q（b5-T4 占位行样式）", anchor)
+		}
+	}
+}

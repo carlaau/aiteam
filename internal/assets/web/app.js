@@ -619,7 +619,12 @@ function renderBus(data) {
       el('span', 'badge ' + (LEVEL_CLASS[m.level] || 'lv-normal'), txt(m.level)),
       el('b', null, txt(m.sender)),
       el('span', 'bus-time', fmtTime(m.created_at)),
-      el('span', 'bus-body', txt(m.body_preview)),
+      // b5-T4：墓碑行（recalled=true）渲占位行不渲正文——服务端 body_preview 已
+      // 剥空（store SQL 层硬闸），占位文案归前端装配；bus v1 不可撤（R1.2 排除
+      // 面），本分支为 #26 统一读面的契约兜底（防未来 bus 开放撤回漏改此处）
+      m.recalled === true
+        ? el('span', 'bus-body recalled-placeholder', '消息已由发送方撤回')
+        : el('span', 'bus-body', txt(m.body_preview)),
     );
     pane.append(row);
   }

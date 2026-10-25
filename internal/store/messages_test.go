@@ -215,8 +215,10 @@ func TestPollPredicateDirect(t *testing.T) {
 
 // ---- TestPollPredicateBus：bus 分支（项目级可见性 + controller 角色闸 + D7 不回看）----
 
-// TestPollPredicateBus AC6.2/D7：controller 对同项目全部 bus 可见（含跨栏目——
-// bus 分支只按 project_id 过滤）；非 controller 角色恒不可见（角色闸参数化在
+// TestPollPredicateBus AC6.2/D7 + b2-T1（M-33）：controller 对同项目**他人发的**
+// bus 可见（含跨栏目——bus 分支只按 project_id 过滤）；b2-T1 起消费方自发 bus
+// 回声排除（b1 断言按新语义更新：自发不回投，他人照收——AC2①② 详测归
+// TestPollBusExcludeSender）；非 controller 角色恒不可见（角色闸参数化在
 // SQL 谓词内）；新登记栏目位点=登记时 MAX(seq)（B1 InitColumnPositions 预置），
 // 历史 bus 不回灌（D7 不回看），此后新发的 bus 正常可见。
 func TestPollPredicateBus(t *testing.T) {
@@ -231,13 +233,17 @@ func TestPollPredicateBus(t *testing.T) {
 	b1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindBus, SenderSessionID: ctrl, SenderLabel: "controller@01", Level: "normal", Body: "bus-1"}, t0)
 	b2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cB, Kind: MessageKindBus, SenderSessionID: exe, SenderLabel: "executor-A@02", Level: "important", Body: "bus-2"}, t0)
 
-	// controller（挂栏目 A、位点 0）：跨栏目见项目全部 bus（AC6.2）。
+	// controller（挂栏目 A、位点 0）：b2-T1 起自发 b1 排除（不回投自己信箱），
+	// 跨栏目的 b2（cB 发）照收（AC6.2 跨栏目可见性对他人发的 bus 不变）。
 	got, err := s.PollVisible(pid, cA, "controller", ctrl, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("PollVisible(controller) 失败: %v", err)
 	}
-	if want := []int64{b1, b2}; !slices.Equal(seqs(got), want) {
-		t.Errorf("controller 位点 0 = %v，期望 %v（跨栏目同项目 bus 全可见）", seqs(got), want)
+	if want := []int64{b2}; !slices.Equal(seqs(got), want) {
+		t.Errorf("controller 位点 0 = %v，期望 %v（自发 b1 排除；跨栏目 b2 可见）", seqs(got), want)
+	}
+	if slices.Contains(seqs(got), b1) {
+		t.Errorf("自发 bus b1(seq=%d) 不应回投发送方自己信箱（b2-T1/M-33 自发回声排除）", b1)
 	}
 
 	// executor（位点 0）：bus 分支角色闸关闭，bus 不可见（direct 亦无）——
@@ -271,13 +277,74 @@ func TestPollPredicateBus(t *testing.T) {
 	}
 
 	// 此后新发 bus：新栏目位点之上，正常可见。
-	b3 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindBus, SenderSessionID: ctrl, SenderLabel: "controller@01", Level: "normal", Body: "bus-3"}, t0)
+	// b2-T1：发送方从 ctrl 改 exe——D7「位点之上新 bus 可见」的意图保留给他人
+	// 发的 bus（ctrl 自发回声已被新谓词排除，自发排除面归 TestPollBusExcludeSender）。
+	b3 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindBus, SenderSessionID: exe, SenderLabel: "executor-A@01", Level: "normal", Body: "bus-3"}, t0)
 	got, err = s.PollVisible(pid, cC.ID, "controller", ctrl, pos, 0, 0)
 	if err != nil {
 		t.Fatalf("PollVisible(新 bus 后) 失败: %v", err)
 	}
 	if want := []int64{b3}; !slices.Equal(seqs(got), want) {
 		t.Errorf("新栏目位点之上 = %v，期望 %v", seqs(got), want)
+	}
+}
+
+// ---- TestPollBusExcludeSender：bus 投递排除发送方本人（b2-T1 R2/M-33，AC2）----
+
+// TestPollBusExcludeSender b2-R2（M-33）AC2：bus 信箱投递排除发送方本人——
+// ①发送方自己的 bus 不进自己信箱（poll 结果不含）②同项目其他 controller 格
+// 照常收到（广播语义对他人不变）③direct/chat/receipt 投递零回归（与排除后
+// 的 bus 同一结果集并存断言）；另锁两条边界：sender_session_id=0（系统/看板）
+// bus 照投（排除只精确匹配消费方会话 id）与位点过滤正交（位点越过自发 bus
+// 后组合无互扰——兼容口径：排除只影响「未消费回声」，无位点迁移）。
+func TestPollBusExcludeSender(t *testing.T) {
+	s := openTemp(t)
+	const t0 = "2026-10-02T08:00:00Z"
+	pid := seedProject(t, s, "p-a", "项目A", ProjectStatusActive, 900, t0)
+	cA := seedColumn(t, s, pid, "01", "栏目01", ColumnStatusActive, t0)
+	cB := seedColumn(t, s, pid, "02", "栏目02", ColumnStatusActive, t0)
+	ctrlA := seedSession(t, s, pid, cA, "controller", "controller", t0, t0)
+	ctrlB := seedSession(t, s, pid, cB, "controller", "controller", t0, t0)
+	exe := seedSession(t, s, pid, cA, "executor-A", "executor", t0, t0)
+
+	// seq 递增：d1(direct→controller@01) bSelf(ctrlA 自发) bOther(ctrlB 发)
+	// bSys(系统发) ch1(chat→ctrlA) r1(receipt→ctrlA)。
+	d1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindDirect, TargetRole: "controller", SenderSessionID: exe, SenderLabel: "executor-A@01", Level: "normal", Body: "d1"}, t0)
+	bSelf := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindBus, SenderSessionID: ctrlA, SenderLabel: "controller@01", Level: "normal", Body: "bus-self"}, t0)
+	bOther := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cB, Kind: MessageKindBus, SenderSessionID: ctrlB, SenderLabel: "controller@02", Level: "important", Body: "bus-other"}, t0)
+	bSys := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindBus, SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "bus-sys"}, t0)
+	ch1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindChat, TargetSessionID: ctrlA, SenderSessionID: 0, SenderLabel: "board-user:张三", Level: "normal", Body: "ch1"}, t0)
+	r1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: cA, Kind: MessageKindReceipt, TargetSessionID: ctrlA, SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "receipt: seq=1"}, t0)
+
+	// AC2①③：发送方 ctrlA 视角——自发 bSelf 排除；他人发的 bus（bOther/bSys）
+	// 照收，direct/chat/receipt（d1/ch1/r1）零回归同集断言（seq 升序）。
+	got, err := s.PollVisible(pid, cA, "controller", ctrlA, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("PollVisible(ctrlA) 失败: %v", err)
+	}
+	if want := []int64{d1, bOther, bSys, ch1, r1}; !slices.Equal(seqs(got), want) {
+		t.Errorf("ctrlA = %v，期望 %v（自发 bus 排除；他人 bus 与 direct/chat/receipt 照收）", seqs(got), want)
+	}
+
+	// AC2②：同项目另一 controller（ctrlB@02）照常收到 bSelf（广播对他人不变）；
+	// 对称反证——ctrlB 自发的 bOther 对自己排除；ctrlB 视角 direct/chat 均不命中
+	// （目标全是 ctrlA/栏目 A），只余 [bSelf, bSys]。
+	got, err = s.PollVisible(pid, cB, "controller", ctrlB, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("PollVisible(ctrlB) 失败: %v", err)
+	}
+	if want := []int64{bSelf, bSys}; !slices.Equal(seqs(got), want) {
+		t.Errorf("ctrlB = %v，期望 %v（他人 bus 照收、自发排除、系统 bus 照投）", seqs(got), want)
+	}
+
+	// 位点正交：信箱位点越过 bSelf 后排除条件与位点过滤组合无互扰（排除只在
+	// 位点之上再剔自发，结果集=位点过滤后剔 bSelf——此处位点已越过，两者等效）。
+	got, err = s.PollVisible(pid, cA, "controller", ctrlA, bSelf, 0, 0)
+	if err != nil {
+		t.Fatalf("PollVisible(ctrlA, 信箱位点=%d) 失败: %v", bSelf, err)
+	}
+	if want := []int64{bOther, bSys, ch1, r1}; !slices.Equal(seqs(got), want) {
+		t.Errorf("ctrlA 信箱位点=%d = %v，期望 %v（排除与位点过滤正交）", bSelf, seqs(got), want)
 	}
 }
 
@@ -388,8 +455,10 @@ func TestPollVisibleMixedBranchesLimit(t *testing.T) {
 	ctrl := seedSession(t, s, pid, c1, "controller", "controller", t0, t0)
 
 	// seq 递增：dc1(direct→controller) b1(bus) ch1(chat→ctrl) ch2(chat→ctrl) dc2(direct→controller)
+	// b2-T1：bus 发送方=系统（0）——消费方是 ctrl，自发回声会被新谓词排除；
+	// 混合分支覆盖需非自发 bus（系统 bus 对 controller 照投，断言期望值不变）。
 	dc1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindDirect, TargetRole: "controller", SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "dc1"}, t0)
-	b1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: ctrl, SenderLabel: "controller@01", Level: "normal", Body: "b1"}, t0)
+	b1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindBus, SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "b1"}, t0)
 	ch1 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindChat, TargetSessionID: ctrl, SenderSessionID: 0, SenderLabel: "board-user:张三", Level: "important", Body: "ch1"}, t0)
 	ch2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindChat, TargetSessionID: ctrl, SenderSessionID: 0, SenderLabel: "board-user:张三", Level: "normal", Body: "ch2"}, t0)
 	dc2 := seedMessageFull(t, s, MessageInput{ProjectID: pid, ColumnID: c1, Kind: MessageKindDirect, TargetRole: "controller", SenderSessionID: 0, SenderLabel: "system", Level: "normal", Body: "dc2"}, t0)

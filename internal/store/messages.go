@@ -83,6 +83,13 @@ type Message struct {
 	ProgressTask       string // progress 行=progress_reports.task；消息行 ""
 	ProgressTestStatus string // progress 行=test_status（pass|fail|unknown）；消息行 ""
 	ProgressCommitHash string // progress 行=commit_hash；消息行 ""
+
+	// —— b5-T4 看板墓碑读面标记（QueryHistory/QuerySessionTimeline 装配）——
+	// 红笔最小桩（编译面）：仅字段声明，装配在绿笔 SQL 层落地。poll/GetMessageBySeq
+	// 等其余读路径恒零值 false——poll 消费面 pollVisibleSQL NOT EXISTS 已整体过滤
+	// 墓碑（b5-T1 红线，勿动），永远轮不到本标记表达。无 json tag 属 store 内部
+	// 结构（同上 progress 装配面先例），wire 键名归 handler 专用 row 结构。
+	Recalled bool
 }
 
 // MessageInput InsertMessage 入参：column_id 与 target 字段由调用方按 kind 归属
@@ -204,30 +211,63 @@ func (s *Store) GetMessageBySeq(seq int64) (MessageDomain, error) {
 	return md, nil
 }
 
-// pollVisibleSQL poll 可见性谓词（§3.6 逐字对拍，命名占位符 :x → ? 绑定参数）：
+// pollVisibleSQL poll 可见性谓词（§3.6 对拍基底 + b2-R2 bus 增补，命名占位符
+// :x → ? 绑定参数）：
 //
 //	参数：pos_m=信箱位点, pos_d=对话位点, ?1 栏目, ?2 角色, ?3 项目, ?4/5 会话 id,
 //	     ?6=角色（bus 分支 :r = 'controller' 判断——按设计注「:bus_role 判断在 Go 侧」
-//	     参数化保留在谓词内，role 经绑定参数传入，无字符串拼接）。
+//	     参数化保留在谓词内，role 经绑定参数传入，无字符串拼接）；b2-R2 追加 bus
+//	     分支发送方排除占位符（绑定值=?4 会话 id——该值三处绑定：bus 排除+
+//	     chat/receipt 的目标会话与排除自发）。
 //
 // 三分支语义：
 //   - direct：栏目+角色命中且 seq > 信箱位点；
-//   - bus：同项目且 seq > 信箱位点且角色为 controller（AC6.2 跨栏目可见、D7 不回看
-//     由位点值保证——位点=调用方传入，B2-2 GetPositions/惰性初始化提供）；
+//   - bus：同项目且 seq > 信箱位点且角色为 controller 且非自发（b2-R2/M-33：
+//     发送方自己的 bus 不回投自己信箱，同项目其他 controller 格照常收到——广播
+//     语义对他人不变；sender_session_id=0 系统/看板 bus 不受排除影响——前提是
+//     消费方 sessionID≠0：poll 若以 session=0 调用，0<>0 会连带排除 sender=0
+//     的 bus，当前不可达——无 sender=0 的 bus 写入路径，且 handler/CLI 恒传真实
+//     会话 id，登记防未来误导（T1 审查建议）；AC6.2 跨栏目可见、D7 不回看由
+//     位点值保证——位点=调用方传入，B2-2 GetPositions/惰性初始化提供）；
 //   - chat/receipt：目标会话命中且排除自发（自己的回复不回流，§2.2 #24 语义）
 //     且 seq > 对话位点（AC15.4 会话隔离）。
+//
+// b2-R2 与省略 ack 侧的口径分歧（登记）：位点机制（positions.go maxVisibleMailbox，
+// b2 红线冻结零触碰）的 bus 分支不排除发送方——省略 ack 会越过自发 bus 推进信箱
+// 位点（自发消息=已处理语义，位点只进不退，无害）；两侧一致性由
+// TestAdvanceOmittedMatchesPollPredicate 机械对拍守门（其夹具不含自发回声 bus）。
 //
 // LIMIT 由 PollVisible 按入参追加（D8：0=全量不追加，>0 追加 LIMIT ?）。
 //
 // 已知代价（审查登记，量级上来再议）：三分支 OR 合一随数据量线性扫（bus 分支
 // 有 idx_messages_bus 部分索引支撑，direct/chat 各有前缀索引）；量大后可演进为
 // 三分支 UNION ALL 归并各走索引——当前单机 SQLite+消息量级（万级）下 OR 形态
-// 足够，且保持 §3.6 谓词逐字对拍。
+// 足够（b2-R2 增补后 bus 分支不再 §3.6 逐字，谓词冻结面以本注释为准）。
+//
+// b5-T1 消费面墓碑过滤（M-36/b5-spec R2.3）：三分支统一追加 NOT EXISTS
+// recalled_messages——撤回消息对 poll 消费面零可见（AC2① 内容永不可见）。
+// direct/chat 是可撤 kind（b5-spec R1.2）必加；bus v1 不可撤（墓碑不可达）但
+// 过滤条件统一加（裁量④倾向统一，防未来 bus 开放撤回时漏改此处）——恒空子
+// 查询下语义零变化，message_seq 是 INTEGER PRIMARY KEY（rowid 别名），探测走
+// 行键无额外索引需求。子查询无绑定参数（仅相关列 m.seq），args 序不变。
+//
+// 与省略 ack 侧的口径分歧登记（b5 追加）：maxVisibleMailbox（positions.go，
+// b2 红线冻结面）**不加**墓碑过滤——省略 ack 信箱位点会越位跨过墓碑 seq（poll
+// 可见最大 0 而位点=墓碑 seq）。无害性论证同自发回声 bus（本文件上文登记段）：
+// seq 单调递增，墓碑 seq 只进不退也永不再投递，越位只吞墓碑本身、不吞任何
+// （现在或将来）poll 可见消息——TestRecallOmittedAckSwallowsRecalledSeq 两面
+// 锁定（分歧存在性+无害性），结构镜像 TestAdvanceOmittedSwallowsSelfBusOnly。
+// 机械对拍门 TestAdvanceOmittedMatchesPollPredicate 不受影响：其夹具不落墓碑
+// 行，两侧可见集恒等。
 const pollVisibleSQL = `SELECT ` + messageSelectColumns + ` FROM messages m
-WHERE (m.kind = 'direct' AND m.column_id = ? AND m.target_role = ? AND m.seq > ?)
-   OR (m.kind = 'bus'    AND m.project_id = ? AND m.seq > ? AND ? = 'controller')
+WHERE (m.kind = 'direct' AND m.column_id = ? AND m.target_role = ? AND m.seq > ?
+       AND NOT EXISTS (SELECT 1 FROM recalled_messages r WHERE r.message_seq = m.seq))
+   OR (m.kind = 'bus'    AND m.project_id = ? AND m.seq > ? AND ? = 'controller'
+       AND m.sender_session_id <> ?
+       AND NOT EXISTS (SELECT 1 FROM recalled_messages r WHERE r.message_seq = m.seq))
    OR (m.kind IN ('chat','receipt') AND m.target_session_id = ?
-       AND m.sender_session_id != ? AND m.seq > ?)
+       AND m.sender_session_id != ? AND m.seq > ?
+       AND NOT EXISTS (SELECT 1 FROM recalled_messages r WHERE r.message_seq = m.seq))
 ORDER BY m.seq ASC`
 
 // PollVisible poll 可见性查询（§2.2 #10 数据面，§3.6 谓词单条 SQL 三分支原样）：
@@ -237,7 +277,8 @@ ORDER BY m.seq ASC`
 //   - projectID：项目 id（bus 分支 :p）；
 //   - columnID：栏目 id（direct 分支 :c——消费方所在信箱栏目）；
 //   - role：消费方角色（direct 命中键 + bus 的 controller 闸，同一参数两处绑定）；
-//   - sessionID：消费方会话 id（chat/receipt 分支 :s）；
+//   - sessionID：消费方会话 id（chat/receipt 分支 :s；b2-R2 起 bus 分支发送方排除
+//     也绑定此值——自发 bus 不回投自己信箱，M-33/AC2）；
 //   - mailboxPos：信箱位点 pos_m（direct+bus 共用，seq 严格大于）；
 //   - dialogPos：对话位点 pos_d（chat/receipt 用，seq 严格大于）；
 //   - limit：>0=LIMIT n；0=全量（D8 显式 0 要全量）；<0=ErrInvalidLimit。
@@ -248,7 +289,10 @@ func (s *Store) PollVisible(projectID, columnID int64, role string, sessionID, m
 		return nil, fmt.Errorf("%w: %d（负值非法；0=全量，正数=条数）", ErrInvalidLimit, limit)
 	}
 	q := pollVisibleSQL
-	args := []any{columnID, role, mailboxPos, projectID, mailboxPos, role, sessionID, sessionID, dialogPos}
+	// 占位符按 SQL 文本序绑定：direct(栏目,角色,信箱位点) → bus(项目,信箱位点,
+	// 角色闸,发送方排除) → chat/receipt(目标会话,排除自发,对话位点)——sessionID
+	// 同值三处绑定（b2-R2 起 bus 排除为其一）。
+	args := []any{columnID, role, mailboxPos, projectID, mailboxPos, role, sessionID, sessionID, sessionID, dialogPos}
 	if limit > 0 {
 		q += ` LIMIT ?`
 		args = append(args, limit)
@@ -293,6 +337,12 @@ type CrossGridPending struct {
 // 纪律同 PollHits）。归属裁量注：落 messages.go 非 sentinels.go——消费方是 #10 信箱
 // poll handler（cross_grid_hint 装配），与 PollVisible 同端点域；sentinels.go 组织
 // 围绕哨兵行与 #14/#15/#16 端点，本查询无哨兵语义。
+//
+// b5-T6 分歧登记（终审建议①）：b5-T1 起 pollVisibleSQL direct 分支追加墓碑过滤，
+// 本查询经 pollHitsSQL direct 分支同口径与之成同族，**不含**墓碑过滤——已撤
+// direct 仍计入他格 pending 计数（cross_grid_hint 只出 role/pending 两键，零正文
+// 外泄面）；无害：位点只进不退，计数幽灵随他格 ack 后消散，行为零变化是 b5 红线
+// 要求。
 const crossGridDirectPendingSQL = `
 SELECT m.target_role, COUNT(*)
 FROM messages m
@@ -346,6 +396,10 @@ type HistoryFilter struct {
 // 未命中经子查询自然落空（空结果非 404——#13 特有错误仅通用组）。默认 seq 降序
 // 取最新 50 条；seq 单调递增=时间序（§3.1 第 3 条），排序键用 seq 比.created_at
 // 文本序更稳（同秒多消息有全序）。
+//
+// b5-T4 看板墓碑读面：SELECT 换 boardHistorySelectColumns（body 墓碑行 SQL 层
+// 剥离+recalled 标记同源表达式）+FROM 增 LEFT JOIN recalled_messages（#13/#26
+// 两端点同源观测面；poll 消费面 pollVisibleSQL 不在本查询域，红线不受涉）。
 func (s *Store) QueryHistory(f HistoryFilter) ([]Message, error) {
 	// order 白名单：值拼入 SQL 文本（LIMIT 前无参数位），必须枚举校验防注入。
 	order := "DESC"
@@ -407,7 +461,7 @@ func (s *Store) QueryHistory(f HistoryFilter) ([]Message, error) {
 		args = append(args, f.SentBy)
 	}
 
-	q := `SELECT ` + messageSelectColumns + ` FROM messages m`
+	q := `SELECT ` + boardHistorySelectColumns + boardHistoryJoinSQL
 	if len(conds) > 0 {
 		q += ` WHERE ` + strings.Join(conds, ` AND `)
 	}
@@ -421,7 +475,7 @@ func (s *Store) QueryHistory(f HistoryFilter) ([]Message, error) {
 	defer rows.Close()
 	out := make([]Message, 0)
 	for rows.Next() {
-		m, err := scanMessage(rows.Scan)
+		m, err := scanBoardMessage(rows.Scan)
 		if err != nil {
 			return nil, fmt.Errorf("store: 扫描历史消息行失败: %w", err)
 		}
@@ -498,6 +552,12 @@ func (s *Store) QueryDialog(sessionID int64, limit int) ([]Message, error) {
 // 裁剪（progress 行与消息行同权计入窗口，挤占保底后备=§7.3 走查实证再议）；
 // 空命中返回非 nil 空切片（JSON null 防线）。
 //
+// b5-T4 看板墓碑读面：chat/direct 两消息路 SELECT 换 boardHistorySelectColumns
+// 同款表达式+LEFT JOIN（body 墓碑行 SQL 层剥离+recalled 标记）；progress 路无
+// 墓碑语义（合成行不占 messages seq 空间，墓碑 FK 不可达）恒 0 占位。WHERE 谓词
+// 逐字不动（Q2 冻结面），SELECT 列表 16→17 列（recalled 插在 created_at 与
+// p_batch 之间——消息本位列聚一起，scanTimelineRow 位序随动）。
+//
 // 已知代价（b5-W2 更新为 UNION 形态账）：三路各走既有索引（chat=idx_messages_chat
 // 部分索引/direct=idx_messages_direct 前缀/progress=idx_progress_session_time
 // 前缀命中），原两路 OR 线性扫代价段被 UNION 拆分顺带改善；本查询即 messages.go
@@ -508,19 +568,25 @@ func (s *Store) QuerySessionTimeline(sessionID, columnID int64, role string, lim
 	}
 	rows, err := s.DB.Query(
 		`SELECT m.seq, m.project_id, m.column_id, m.kind, m.target_role, m.target_session_id,
-       m.sender_session_id, m.sender_label, m.level, m.body, m.created_at,
+       m.sender_session_id, m.sender_label, m.level,
+       CASE WHEN r.message_seq IS NOT NULL THEN '' ELSE m.body END AS body, m.created_at,
+       (r.message_seq IS NOT NULL) AS recalled,
        '' AS p_batch, '' AS p_task, '' AS p_test, '' AS p_hash, 0 AS p_id
 	FROM messages m
+	LEFT JOIN recalled_messages r ON r.message_seq = m.seq
 	WHERE (m.kind = 'chat' AND m.target_session_id = ?)
 	UNION ALL
 	SELECT m.seq, m.project_id, m.column_id, m.kind, m.target_role, m.target_session_id,
-	       m.sender_session_id, m.sender_label, m.level, m.body, m.created_at,
+	       m.sender_session_id, m.sender_label, m.level,
+	       CASE WHEN r.message_seq IS NOT NULL THEN '' ELSE m.body END AS body, m.created_at,
+	       (r.message_seq IS NOT NULL) AS recalled,
 	       '', '', '', '', 0
 	FROM messages m
+	LEFT JOIN recalled_messages r ON r.message_seq = m.seq
 	WHERE (m.kind = 'direct' AND m.column_id = ? AND m.target_role = ?)
 	UNION ALL
 	SELECT 0, 0, 0, 'progress', '', 0,
-	       0, '', 'normal', COALESCE(p.summary, ''), p.created_at,
+	       0, '', 'normal', COALESCE(p.summary, ''), p.created_at, 0,
 	       COALESCE(p.batch, ''), COALESCE(p.task, ''), COALESCE(p.test_status, ''), COALESCE(p.commit_hash, ''), p.id
 	FROM progress_reports p
 	WHERE p.session_id = ?
@@ -546,10 +612,12 @@ func (s *Store) QuerySessionTimeline(sessionID, columnID int64, role string, lim
 	return out, nil
 }
 
-// scanTimelineRow 从一行解出 QuerySessionTimeline 合流行（b5-W2）：16 列=消息
-// 本位 11 列+progress 装配 4 列+排序列 p_id（仅 SQL ORDER BY 消费，Go 侧弃扫进
-// 局部变量——progress_reports.id 不入 Message，防与消息 seq 空间串号）。可空列
-// 已在 SQL 侧 COALESCE/字面量兜成非 NULL，直接扫 string。
+// scanTimelineRow 从一行解出 QuerySessionTimeline 合流行（b5-W2，b5-T4 扩 17 列）：
+// 消息本位 11 列（body 列 b5-T4 起为墓碑感知 CASE 表达式）+recalled 标记+progress
+// 装配 4 列+排序列 p_id（仅 SQL ORDER BY 消费，Go 侧弃扫进局部变量——
+// progress_reports.id 不入 Message，防与消息 seq 空间串号）。可空列已在 SQL 侧
+// COALESCE/字面量兜成非 NULL，直接扫 string；progress 路 recalled 恒 0（合成行
+// 无墓碑语义）。
 func scanTimelineRow(scan func(dest ...any) error) (Message, error) {
 	var (
 		m   Message
@@ -557,7 +625,7 @@ func scanTimelineRow(scan func(dest ...any) error) (Message, error) {
 	)
 	err := scan(&m.Seq, &m.ProjectID, &m.ColumnID, &m.Kind, &m.TargetRole,
 		&m.TargetSessionID, &m.SenderSessionID, &m.SenderLabel,
-		&m.Level, &m.Body, &m.CreatedAt,
+		&m.Level, &m.Body, &m.CreatedAt, &m.Recalled,
 		&m.ProgressBatch, &m.ProgressTask, &m.ProgressTestStatus, &m.ProgressCommitHash, &pID)
 	if err != nil {
 		return Message{}, err

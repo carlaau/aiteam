@@ -131,16 +131,18 @@ func NewServer(st *store.Store, cfg *config.ServerConfig, version string) http.H
 	// 后续业务端点按功能域在各自批次追加注册。
 	s.handle(http.MethodGet, "/api/v1/ping", s.handlePing)
 	s.handle(http.MethodGet, "/api/v1/version", s.handleVersion)
-	// 登记域八端点（§2.2 #1~#8，B1-5）：pattern 照表逐字（{code}/{col} 为
-	// Go 1.22 路径参数，handler 内 r.PathValue 取值）。
-	s.handle(http.MethodPost, "/api/v1/projects", s.handleProjectCreate)                        // #1
-	s.handle(http.MethodPatch, "/api/v1/projects/{code}", s.handleProjectUpdate)                // #2
-	s.handle(http.MethodDelete, "/api/v1/projects/{code}", s.handleProjectArchive)              // #3
-	s.handle(http.MethodGet, "/api/v1/projects", s.handleProjectList)                           // #4
-	s.handle(http.MethodPost, "/api/v1/projects/{code}/columns", s.handleColumnCreate)          // #5
-	s.handle(http.MethodPatch, "/api/v1/projects/{code}/columns/{col}", s.handleColumnUpdate)   // #6
-	s.handle(http.MethodDelete, "/api/v1/projects/{code}/columns/{col}", s.handleColumnArchive) // #7
-	s.handle(http.MethodGet, "/api/v1/projects/{code}/columns", s.handleColumnList)             // #8
+	// 登记域端点（§2.2 #1~#8，B1-5；M-31 两族 unarchive 逆动词就近挂靠）：
+	// pattern 照表逐字（{code}/{col} 为 Go 1.22 路径参数，handler 内 r.PathValue 取值）。
+	s.handle(http.MethodPost, "/api/v1/projects", s.handleProjectCreate)                                  // #1
+	s.handle(http.MethodPatch, "/api/v1/projects/{code}", s.handleProjectUpdate)                          // #2
+	s.handle(http.MethodDelete, "/api/v1/projects/{code}", s.handleProjectArchive)                        // #3
+	s.handle(http.MethodPost, "/api/v1/projects/{code}/unarchive", s.handleProjectUnarchive)              // M-31（#3 逆动词）
+	s.handle(http.MethodGet, "/api/v1/projects", s.handleProjectList)                                     // #4
+	s.handle(http.MethodPost, "/api/v1/projects/{code}/columns", s.handleColumnCreate)                    // #5
+	s.handle(http.MethodPatch, "/api/v1/projects/{code}/columns/{col}", s.handleColumnUpdate)             // #6
+	s.handle(http.MethodDelete, "/api/v1/projects/{code}/columns/{col}", s.handleColumnArchive)           // #7
+	s.handle(http.MethodPost, "/api/v1/projects/{code}/columns/{col}/unarchive", s.handleColumnUnarchive) // M-31（#7 逆动词）
+	s.handle(http.MethodGet, "/api/v1/projects/{code}/columns", s.handleColumnList)                       // #8
 	// 会话/审计辅助（§2.2 #27/#28，B1-6）：心跳面观测口+操作留痕核验口。
 	s.handle(http.MethodGet, "/api/v1/sessions", s.handleSessionList) // #27
 	s.handle(http.MethodGet, "/api/v1/audit", s.handleAuditList)      // #28
@@ -157,6 +159,9 @@ func NewServer(st *store.Store, cfg *config.ServerConfig, version string) http.H
 	s.handle(http.MethodPost, "/api/v1/acks", s.handleMessageAck)                       // #11
 	s.handle(http.MethodPost, "/api/v1/messages/{seq}/receipt", s.handleMessageReceipt) // #12
 	s.handle(http.MethodGet, "/api/v1/messages", s.handleMessageHistory)                // #13
+	// b5 消息撤回端点（b5-spec R3，M-36；消息域端点区就近挂靠——#12 receipt 的
+	// {seq} 近邻动词位）。端点计数 34→35（AGENTS.md 目录地图行同步）。
+	s.handle(http.MethodPost, "/api/v1/messages/{seq}/recall", s.handleMessageRecall)
 	// B4-2 资源域三端点（§2.2 #18/#19/#20）
 	s.handle(http.MethodPost, "/api/v1/resources", s.handleRegisterResource)
 	s.handle(http.MethodDelete, "/api/v1/resources/{id}", s.handleReleaseResource)

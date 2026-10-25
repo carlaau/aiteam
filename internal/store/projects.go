@@ -325,6 +325,74 @@ func (s *Store) ArchiveProjectWithAudit(code string, entry AuditEntry, detailFn 
 	return audit, nil
 }
 
+// projectUnarchiveSQL 项目反归档单源语句（UnarchiveProject 与事务变体共用）：
+// CASE 表达式幂等语义镜像 projectArchiveSQL——已 active 再 unarchive 不刷
+// updated_at，0 行命中（目标不存在）由调用方判。
+const projectUnarchiveSQL = `UPDATE projects
+ SET status = 'active',
+     updated_at = CASE WHEN status = 'archived' THEN ? ELSE updated_at END
+ WHERE code = ?`
+
+// UnarchiveProject 反归档（M-31 数据面，archive 的逆动词）：纯反归档版（无审计），
+// 事务变体见 UnarchiveProjectWithAudit——handler 层反归档动作用 WithAudit 版
+// （AC1.4 同型原子）。幂等语义「目标不存在才 404」：已 active 再 unarchive 幂等
+// 成功且不刷 updated_at（CASE 表达式保持原值），单条 UPDATE 完成；code 不存在
+// （0 行匹配）返回 ErrProjectNotFound。
+func (s *Store) UnarchiveProject(code string) error {
+	res, err := s.DB.Exec(projectUnarchiveSQL, types.NowUTC(), code)
+	if err != nil {
+		return fmt.Errorf("store: 反归档项目 %q 失败: %w", code, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: 读取反归档项目 %q 影响行数失败: %w", code, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrProjectNotFound, code)
+	}
+	return nil
+}
+
+// UnarchiveProjectWithAudit 项目反归档+审计同事务（M-31 的 handler 写路径，§七
+// 往返账同 archive）：SELECT before + UPDATE（CASE 幂等语义保留）+ INSERT audit
+// 单事务 3 语句（实测账，口径同 ArchiveProjectWithAudit）。幂等重放照常留痕且
+// detail 记真实前态（重放时 before.Status=active）——与 archive 往返账口径一致。
+func (s *Store) UnarchiveProjectWithAudit(code string, entry AuditEntry, detailFn func(before Project) string) (AuditEntry, error) {
+	tx, err := s.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 开启反归档项目事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	before, err := scanProject(tx.QueryRow(`SELECT `+projectColumns+` FROM projects WHERE code = ?`, code).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuditEntry{}, fmt.Errorf("%w: %s", ErrProjectNotFound, code)
+	}
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 定位项目 %q 失败: %w", code, err)
+	}
+
+	res, err := tx.Exec(projectUnarchiveSQL, types.NowUTC(), code)
+	if err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 反归档项目 %q 失败: %w", code, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		// before SELECT 与 UPDATE 间目标被并发删除的竞态兜底。
+		return AuditEntry{}, fmt.Errorf("%w: %s", ErrProjectNotFound, code)
+	}
+
+	entry.ProjectID = before.ID
+	entry.Detail = detailFn(before)
+	audit, err := insertAuditRow(tx, entry)
+	if err != nil {
+		return AuditEntry{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AuditEntry{}, fmt.Errorf("store: 提交反归档项目事务失败: %w", err)
+	}
+	return audit, nil
+}
+
 // ListProjects 项目列表（§2.2 #4 数据面）：默认仅 active，includeArchived=true 全含；
 // 按 created_at,id 稳定升序（TEXT ISO8601 字典序=时间序，§3.1 第 1 条）。
 func (s *Store) ListProjects(includeArchived bool) ([]Project, error) {

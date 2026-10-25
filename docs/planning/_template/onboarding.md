@@ -80,7 +80,7 @@ aiteam watch --project <项目code> --column <栏目号> --session <执行者C�
 
 ### 五命令速览
 
-`send`（发消息）/`poll`（拉信箱）/`ack`（推进位点+回执）/`status`（状态观测）/`watch`（哨兵值守）；详解见 aiteam 官方指引：github.com/carlaau/aiteam 的 README「给 AI 会话的接入指令」段与该仓 docs/接入指南.md
+`send`（发消息）/`poll`（拉信箱）/`ack`（推进位点+回执）/`status`（状态观测）/`watch`（哨兵值守）；poll 只读、ack 才消费；一键=poll --ack；详解见 aiteam 官方指引：github.com/carlaau/aiteam 的 README「给 AI 会话的接入指令」段与该仓 docs/接入指南.md
 
 ### 开工第一读（任何新会话第一动作）
 

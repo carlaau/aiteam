@@ -1,6 +1,6 @@
 # skills/ 许可与来源说明
 
-本目录共 13 个技能，服务 aiteam 的 S0~S7 流水线方法论。取材自三个来源仓（均以 MIT 发布，与本仓协议兼容），逐技能来源与改写程度如下：
+本目录共 15 个技能，服务 aiteam 的 S0~S7 流水线方法论。外部取材自三个来源仓（均以 MIT 发布，与本仓协议兼容），另含本项目产出（原创+实战反哺），逐技能来源与改写程度如下：
 
 | # | 技能 | 来源 | 改写程度 |
 |---|------|------|---------|
@@ -17,6 +17,8 @@
 | 11 | requirement-grilling | [mattpocock-skills-zh-CN](https://github.com/vinvcn/mattpocock-skills-zh-CN) 的 grilling 访谈方法论（上游 [mattpocock/skills](https://github.com/mattpocock/skills)） | 通用化改写（见下） |
 | 12 | chinese-code-review | [superpowers-zh](https://github.com/jnMetaCode/superpowers-zh) 中国原创技能区 | 原样移植 |
 | 13 | spec-review | aiteam 原创 | 通用化改写（见下） |
+| 14 | idle-controller | 本项目闲时双角色实战产出反哺 | 通用化改写（脱敏+锚点对齐+宿主中性化） |
+| 15 | idle-executor | 本项目闲时双角色实战产出反哺 | 通用化改写（脱敏+锚点对齐+宿主中性化） |
 
 ## 合规说明
 

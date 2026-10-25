@@ -227,6 +227,92 @@ func TestArchiveColumnEndpoint(t *testing.T) {
 	}
 }
 
+// ---- M-31 POST /api/v1/projects/{code}/columns/{col}/unarchive ----
+
+// TestUnarchiveColumnEndpoint 反归档端点（M-31，#7 逆动词，AC2①~⑤）：软删恢复
+// status→active，响应恰 {status:"active"}；位点保留可查；column.unarchive 审计
+// 留痕；幂等重放仍 200 照常留痕；栏目/项目不存在归并 404 column_not_found。
+func TestUnarchiveColumnEndpoint(t *testing.T) {
+	h, st := seedDomain(t)
+	const t0 = "2026-01-01T08:00:00Z"
+	injectFixedClock(t, t0)
+
+	// 前置：登记栏目 06（位点预置 2 行）后经 store 归档作夹具。
+	if _, _, err := st.CreateColumnWithAudit(authProj, store.Column{Code: "06", Name: "栏目06"},
+		store.AuditEntry{Action: store.AuditColumnRegister, Detail: "{}"}); err != nil {
+		t.Fatalf("夹具 06 失败: %v", err)
+	}
+	if err := st.ArchiveColumn(authProj, "06"); err != nil {
+		t.Fatalf("归档夹具 06 失败: %v", err)
+	}
+
+	// AC2①：200 且响应恰 {status:"active"}。
+	rr := doAuthedReq(t, h, http.MethodPost, "/api/v1/projects/p-a/columns/06/unarchive",
+		"", authProj, authCol, authSess, authRole)
+	data := wantData(t, rr, http.StatusOK)
+	if got := data["status"]; got != "active" || len(data) != 1 {
+		t.Errorf("data = %v，期望恰 {status:\"active\"}（b1-spec §2.2）", data)
+	}
+
+	// 数据面：恢复可见（默认列表 05/06 均 active）；位点保留（archive 保留语义的逆面）。
+	active, err := st.ListColumns(authProj, false)
+	if err != nil || len(active) != 2 {
+		t.Fatalf("反归档后默认栏目列表 = %v（err=%v），期望 2（06 恢复可见）", active, err)
+	}
+	var n int
+	if err := st.DB.QueryRow(`SELECT COUNT(*) FROM ack_positions WHERE column_id = ?`,
+		queryColumnID(t, st, authProj, "06")).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("反归档后位点行数 = %d，期望 2（位点保留可查）", n)
+	}
+
+	// AC2④⑤：带四头走完整心跳链（会话 upsert 侧效应可断言），column.unarchive
+	// 审计留痕，detail 记 status 流转真实前态。
+	entries := queryAuditByAction(t, st, store.AuditColumnUnarchive)
+	if len(entries) != 1 {
+		t.Fatalf("column.unarchive 审计行数 = %d，期望 1", len(entries))
+	}
+	e := entries[0]
+	if e.SessionID != querySingleSession(t, st).ID || e.CreatedAt != t0 {
+		t.Errorf("unarchive 审计身份/时间 = (%d,%q)，期望操作会话+注入时钟", e.SessionID, e.CreatedAt)
+	}
+	detail := decodeAuditDetail(t, e)
+	before, _ := detail["before"].(map[string]any)
+	after, _ := detail["after"].(map[string]any)
+	if before == nil || before["status"] != "archived" || after == nil || after["status"] != "active" {
+		t.Errorf("unarchive detail = %v，期望 before.status=archived/after.status=active", detail)
+	}
+
+	// AC2②：幂等重放仍 200，重放照常留痕且 detail 记真实前态（重放时 before 已
+	// 是 active）。
+	rr = doAuthedReq(t, h, http.MethodPost, "/api/v1/projects/p-a/columns/06/unarchive",
+		"", authProj, authCol, authSess, authRole)
+	wantData(t, rr, http.StatusOK)
+	entries = queryAuditByAction(t, st, store.AuditColumnUnarchive)
+	if len(entries) != 2 {
+		t.Fatalf("重放后 column.unarchive 审计行数 = %d，期望 2（动作发生即留痕）", len(entries))
+	}
+	detail = decodeAuditDetail(t, entries[0])
+	if b, _ := detail["before"].(map[string]any); b == nil || b["status"] != "active" {
+		t.Errorf("重放审计 detail.before = %v，期望 status=active（真实前态）", detail["before"])
+	}
+
+	// AC2③：栏目不存在/项目不存在归并 404 column_not_found，不留痕。
+	for _, target := range []string{
+		"/api/v1/projects/p-a/columns/99/unarchive",
+		"/api/v1/projects/nope/columns/06/unarchive",
+	} {
+		rr = doAuthedReq(t, h, http.MethodPost, target,
+			"", authProj, authCol, authSess, authRole)
+		wantErrBody(t, rr, http.StatusNotFound, types.CodeColumnNotFound)
+	}
+	if got := len(queryAuditByAction(t, st, store.AuditColumnUnarchive)); got != 2 {
+		t.Errorf("404 后 column.unarchive 审计行数 = %d，期望仍 2（拒绝动作不留痕）", got)
+	}
+}
+
 // ---- #8 GET /api/v1/projects/{code}/columns ----
 
 // TestListColumnsEndpoint 端点 #8：默认仅 active、include_archived=true 全含；

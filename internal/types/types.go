@@ -71,6 +71,16 @@ const (
 	CodeNotBlockLevel   = "not_block_level"   // 非 block 级不可回执（409，AC7.4）
 )
 
+// b5 消息撤回错误码（b5-spec R1 409 家族，B2-R4 增强后的文案风格——清晰指引）：
+// 四闸四码（存在性 404 复用 message_not_found 不新设）。kind/block 两闸语义分立
+// （kind=形态不可撤、block=级别承诺不可撤），供 CLI 透传与测试锁定。
+const (
+	CodeNotSender          = "not_sender"           // 非发送方本人撤回（409，R1.1）
+	CodeKindNotRecallable  = "kind_not_recallable"  // 非 direct/chat kind 不可撤（409，R1.2：bus/receipt）
+	CodeBlockNotRecallable = "block_not_recallable" // block 级不可撤（409，R1.4 承诺语义——即使未消费）
+	CodeAlreadyConsumed    = "already_consumed"     // 目标格已消费不可撤（409，R1.3）
+)
+
 // B6 token 鉴权错误码（§2.1 鉴权行）：401 统一机器码。
 const (
 	CodeAuthRequired = "auth_required" // 缺失/错误的访问令牌（401，B6 token 鉴权 AC17.3/AC14.6）

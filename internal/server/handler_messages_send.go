@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -178,13 +179,21 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 			// 「目标 栏目/角色 格子…」逐字节不变（AC9.4）；跨项目「目标项目 X 栏目
 			// Y/角色 格子…」指明目标域（同 chat 未命中文案的前缀形态——同 code
 			// 栏目跨项目歧义时定位失败方）。
+			// b2-T2/R4（M-35②）追加清障段：既有主体（格子+数量+名单+教学语）句式
+			// 稳定零改写，仅在其后拼 agentConflictClearing 产出的逐会话「最后活跃/
+			// 预计过期」段+旧窗哨兵机制提示句（追加不重写，AC9.4 主体锚由
+			// TestSendDirectAgentConflictClearingHint 逐字节锚定）。
 			cell := fmt.Sprintf("目标 %s/%s 格子", targetCol, role)
 			if crossProject {
 				cell = fmt.Sprintf("目标项目 %s 栏目 %s/%s 格子", resolveProj, targetCol, role)
 			}
+			names := make([]string, len(alive))
+			for i, a := range alive {
+				names[i] = a.Name
+			}
 			types.WriteError(w, http.StatusConflict, types.CodeAgentConflict,
-				fmt.Sprintf("%s存在 %d 个活会话（%s），请个体化命名 executor_<标识> 或改用 --bus 广播",
-					cell, len(alive), strings.Join(alive, "、")))
+				fmt.Sprintf("%s存在 %d 个活会话（%s），请个体化命名 executor_<标识> 或改用 --bus 广播%s",
+					cell, len(alive), strings.Join(names, "、"), agentConflictClearing(alive)))
 			return
 		}
 		in = store.MessageInput{Kind: store.MessageKindDirect, ColumnID: targetRef.ColumnID, TargetRole: role}
@@ -232,13 +241,28 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		}
 		target, err := s.st.GetSessionByName(sessProjID, targetSess)
 		if errors.Is(err, store.ErrSessionNotFound) {
+			// b4-T3/R3 近邻建议段：目标域会话名清单（≤5，`名称@role`，chatNearbyHint）
+			// 追加在既有文案后；零近邻零段（文案与现状逐字节同）。建议域裁量留痕
+			// （spec 裁量②「目标栏目内」的落地口径）：chat target 无栏目键（§2.2 #9
+			// 只带 session，CLI 亦键缺省不虚构），未命中时会话所属栏目不可知——项目内
+			// 变体取发送方所在栏目（解析域内唯一可知栏目锚；同栏目协作=动因主场景，
+			// 总控 executor_A/executor-A 两连错即同栏目，「不跨栏目」字面成立）；跨项目
+			// 变体发送方栏目在 A 域不属解析域，退化为目标项目全域（「不跨项目」仍
+			// 成立）。清单全量不判活（失联/历史会话名对纠名同样有参考价值，见 store
+			// ListSessionNamesForHint 注）。
+			hintDomain, hintColID := "项目", int64(0)
+			if !crossProject {
+				hintDomain = "栏目 " + colCode
+				hintColID = senderRef.ColumnID
+			}
+			hint := s.chatNearbyHint(sessProjID, hintColID, hintDomain)
 			// 跨项目未命中文案补目标项目前缀（spec W2⑤——同 code 会话跨项目
 			// 歧义时指明域）；项目内文案逐字节不变（AC9.4）。
 			if crossProject {
 				types.WriteError(w, http.StatusNotFound, types.CodeTargetSessionNotFound,
-					"目标项目 "+targetProj+" 无会话 "+targetSess)
+					"目标项目 "+targetProj+" 无会话 "+targetSess+hint)
 			} else {
-				types.WriteError(w, http.StatusNotFound, types.CodeTargetSessionNotFound, "目标会话未注册: "+targetSess)
+				types.WriteError(w, http.StatusNotFound, types.CodeTargetSessionNotFound, "目标会话未注册: "+targetSess+hint)
 			}
 			return
 		}
@@ -290,6 +314,28 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// chatNearbyHint chat 404 近邻建议段文案（b4-T3/R3）：「；<domain> 内会话:
+// a@role、b@role」（≤5，store ListSessionNamesForHint s.id 注册序）——domain=
+// 域措辞（项目内「栏目 <code>」/跨项目「项目」，调用方注入）。零近邻返回
+// 空串（调用方文案与现状逐字节同，非错误不落日志）；查询失败同返回空串但
+// 吞错留 WARN 观测面——对齐 cross_grid_hint 装配降级留痕惯例（460c01c 审查
+// 修：辅助尽力面降级零可观测性则不可诊断），行为不变不反噬主 404 语义。
+func (s *Server) chatNearbyHint(projectID, columnID int64, domain string) string {
+	names, err := s.st.ListSessionNamesForHint(projectID, columnID, 5)
+	if err != nil {
+		slog.Warn("chat 近邻建议段装配降级", "err", err)
+		return ""
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	items := make([]string, len(names))
+	for i, n := range names {
+		items[i] = n.Name + "@" + n.Role
+	}
+	return "；" + domain + " 内会话: " + strings.Join(items, "、")
+}
+
 // senderLabel 发送方冗余显示串（§3.2 表 5：'controller-A@05' 格式）。两段取
 // 身份四头（TrimSpace 后与库中行恒等——sessions 行的 name 即四头 session 值、
 // 栏目 code 即四头 column 值，中间件 upsert 以此二值为幂等键不改写），免查
@@ -298,4 +344,31 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 func senderLabel(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get(types.HeaderAiteamSession)) + "@" +
 		strings.TrimSpace(r.Header.Get(types.HeaderAiteamColumn))
+}
+
+// agentConflictClearing 409 agent_conflict 清障段（b2-T2/R4，M-35②）：既有主体
+// （格子+数量+名单+个体化命名/bus 建议）由调用方原样拼装、句式稳定零改写，本函数
+// 仅产追加后缀——活会话逐个「最后活跃 <Ns/Nm> 前、预计 <eta> 后过期」（eta=项目
+// 级失联阈值−已活秒数；两值均由 ListAliveSessionNames 于判活同一条查询带回，与
+// 判活口径零漂移）+尾附机制提示句（spec §二.R4 原文——被遗忘旧窗哨兵持续续心跳
+// 是「永活不清障」的常见根源，教学说明指向关旧窗）。会话顺序=store 返回的 s.id
+// 稳定序，与主体名单顺序一致。
+func agentConflictClearing(alive []store.AliveSession) string {
+	var b strings.Builder
+	for _, a := range alive {
+		b.WriteString(fmt.Sprintf("；%s 最后活跃 %s 前、预计 %s 后过期",
+			a.Name, fmtHeartbeatDur(a.ElapsedSec), fmtHeartbeatDur(a.TimeoutSec-a.ElapsedSec)))
+	}
+	b.WriteString("。活=失联阈值内（项目级可调）；被遗忘的旧窗哨兵仍在跑会持续续心跳不过期——关旧窗即自然过期")
+	return b.String()
+}
+
+// fmtHeartbeatDur 心跳时长人类可读简写（spec「<Ns/Nm>」口径）：<60s 逐秒；
+// ≥60s 截断至分（整数除法向下截断，非四舍五入——90s=1m、599s=9m；失联阈值
+// 典型 15m 量级，分以下的秒精度对清障决策无信息量）。
+func fmtHeartbeatDur(sec int) string {
+	if sec < 60 {
+		return fmt.Sprintf("%ds", sec)
+	}
+	return fmt.Sprintf("%dm", sec/60)
 }

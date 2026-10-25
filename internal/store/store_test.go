@@ -13,11 +13,13 @@ import (
 )
 
 // wantTables §3.2 十一表清单（TestMigrateCreatesAll / TestReopenIdempotent 逐名断言）；
-// 第 11 表 progress_reports 系 d722b93 全局变更窗（FR23 进度上报）增补。
+// 第 11 表 progress_reports 系 d722b93 全局变更窗（FR23 进度上报）增补；
+// 第 12 表 recalled_messages 系 v0.4-b5 撤回墓碑（M-36，迁移 v4 增补）。
 var wantTables = []string{
 	"projects", "columns", "sessions", "sentinels", "messages",
 	"message_receipts", "ack_positions", "resources", "stage_windows", "audit_log",
 	"progress_reports",
+	"recalled_messages",
 }
 
 // wantTriggers §3.3 append-only 触发器清单。
@@ -327,13 +329,16 @@ func TestMigrationsV3FromProject(t *testing.T) {
 		t.Fatalf("关闭存量 v2 库失败: %v", err)
 	}
 
-	// 重开：migrate 按 user_version=2 跳过 v1/v2、只补 v3——版本止于 3 且既有行零回填。
+	// 重开：migrate 按 user_version=2 跳过 v1/v2、只补其后迁移（v3 自动补列+后续
+	// 增补，b5-T1 起 v4 墓碑表在此路径一并补上）——版本追至迁移数组末位且既有行
+	// 零回填（版本锚=len(migrations)，同本文件 TestMigrateCreatesAll 惯例——
+	// 字面量锚会在每次追加迁移时假红，本测结构面注释「不设末位锚」同款意图）。
 	s2, err := Open(v2Path)
 	if err != nil {
 		t.Fatalf("存量 v2 库重开失败: %v", err)
 	}
-	if v := userVersion(t, s2.DB); v != 3 {
-		t.Errorf("存量 v2 库重开后 user_version = %d，期望 3（v3 自动补列）", v)
+	if v := userVersion(t, s2.DB); v != len(migrations) {
+		t.Errorf("存量 v2 库重开后 user_version = %d，期望 = 迁移数组长度 %d（v3 自动补列+后续增补）", v, len(migrations))
 	}
 	var stock string
 	if err := s2.DB.QueryRow(`SELECT from_project FROM messages LIMIT 1`).Scan(&stock); err != nil {
@@ -352,8 +357,8 @@ func TestMigrationsV3FromProject(t *testing.T) {
 		t.Fatalf("二次重开失败: %v", err)
 	}
 	defer func() { _ = s3.Close() }()
-	if v := userVersion(t, s3.DB); v != 3 {
-		t.Errorf("二次重开后 user_version = %d，期望 3（幂等）", v)
+	if v := userVersion(t, s3.DB); v != len(migrations) {
+		t.Errorf("二次重开后 user_version = %d，期望 %d（幂等）", v, len(migrations))
 	}
 }
 
