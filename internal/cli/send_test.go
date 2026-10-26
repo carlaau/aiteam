@@ -259,16 +259,17 @@ func TestSendToProjectFlag(t *testing.T) {
 	assertNoMirrorFile(t, sendMirrorPath(root404, regAuthProject, regAuthColumn))
 
 	// ④′ 归因判别（b5-W3 质量审修）：project_not_found 双发射源——目标域（跨项目
-	// 解析「项目不存在: <目标code>」）与身份域（心跳中间件「项目未登记: <发送方
-	// project>」）。发送方自身项目拼错+带 --to-project 时不得误报「目标项目不
-	// 存在」（目标项目实存），rc=4 透传身份域文案（AC9.2 指明真实缺失层级）。
+	// 解析「项目不存在: <目标code>」）与身份域（心跳中间件「身份挂靠项目 <发送方
+	// project> 不存在」，M-40 自诊断文案）。发送方自身项目拼错+带 --to-project 时
+	// 不得误报「目标项目不存在」（目标项目实存），rc=4 透传身份域文案（AC9.2 指
+	// 明真实缺失层级）。
 	_, stderr = runWantCode(t, "身份域坏项目+--to-project", 4, func() int {
 		return runSend(ctx, sendArgs("--project", "ghost-a",
 			"--to-project", crossBProject, "--to-role", "executor",
 			"--body", "x", "--mirror-root", t.TempDir()), addr)
 	})
-	if !strings.Contains(stderr, "项目未登记") || !strings.Contains(stderr, "ghost-a") {
-		t.Errorf("身份域坏项目 stderr = %q，期望透传「项目未登记: ghost-a」", stderr)
+	if !strings.Contains(stderr, "身份挂靠项目 ghost-a 不存在") {
+		t.Errorf("身份域坏项目 stderr = %q，期望透传「身份挂靠项目 ghost-a 不存在」", stderr)
 	}
 	if strings.Contains(stderr, "目标项目不存在") {
 		t.Errorf("身份域坏项目 stderr = %q，不应误报「目标项目不存在」（%s 实存，归因判别）", stderr, crossBProject)

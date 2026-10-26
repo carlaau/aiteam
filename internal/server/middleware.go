@@ -119,6 +119,7 @@ func isBoardOptionalHeaderPath(method, path string) bool {
 //	  POST /api/v1/projects 命中系统动作豁免表缺头放行（B2 前置修，总控裁定
 //	  4168d76——首条登记自举引导，见 heartbeatExemptSystemActions）；
 //	② 存在性短路：项目/栏目未登记 → 404 project_not_found/column_not_found
+//	  （文案自诊断化 M-40：指明「身份挂靠位不存在」+register 正解——见 ② 实现处）
 //	  （AC2.2 服务端判据，错误信息指明实体；一条 JOIN 取两行，spec §七往返账）；
 //	③ upsert sessions：首插=隐式注册（AC12.3），重调刷 last_seen_at+覆盖 role
 //	  （AC12.1 心跳，D5 role 静默覆盖）；
@@ -193,15 +194,21 @@ func (s *Server) sessionHeartbeat(next http.Handler) http.Handler {
 			return
 		}
 
-		// ② 存在性短路（AC2.2）：哨兵错误映射 404，错误信息指明实体。
+		// ② 存在性短路（AC2.2）：哨兵错误映射 404，错误信息指明实体。文案自诊断
+		// 化（M-40，v0.4.1）：该 404 在全部端点均指「身份挂靠位不存在」而非目标
+		// 实体——column register 新栏目时 --column 误填新号会被误读为「登记失败」
+		// （外部项目实战踩坑），故明示身份挂靠语义+register 正解（--column 挂
+		// 已存在位、目标走 --code）；错误码 project_not_found/column_not_found
+		// 冻结不动（#31）。
 		ref, err := s.st.GetProjectColumnForSession(projCode, colCode)
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrProjectNotFound):
-				types.WriteError(w, http.StatusNotFound, types.CodeProjectNotFound, "项目未登记: "+projCode)
+				types.WriteError(w, http.StatusNotFound, types.CodeProjectNotFound,
+					"身份挂靠项目 "+projCode+" 不存在——身份四参 --project 须为已登记项目；register 新项目时目标项目走 --code")
 			case errors.Is(err, store.ErrColumnNotFound):
 				types.WriteError(w, http.StatusNotFound, types.CodeColumnNotFound,
-					"栏目未登记: 项目 "+projCode+" 栏目 "+colCode)
+					"身份挂靠栏目 "+colCode+" 不存在（项目 "+projCode+"）——身份四参 --column 须为已登记栏目；register 新栏目时 --column 挂已存在栏目位，目标栏目走 --code")
 			default:
 				slog.Error("会话存在性校验失败", "err", err)
 				types.WriteError(w, http.StatusInternalServerError, types.CodeInternalError, "会话存在性校验失败")

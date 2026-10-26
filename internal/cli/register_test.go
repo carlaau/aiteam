@@ -256,6 +256,38 @@ func TestProjectUpdateArchive(t *testing.T) {
 	}
 }
 
+// TestColumnRegisterIdentityAnchor404 M-40 实战踩坑回归：column register 新栏目
+// 时身份四参 --column 误填目标新栏目号（未登记）→ 心跳中间件存在性短路 404
+// column_not_found，文案须自诊断（指明身份挂靠位语义+register 正解），防误读
+// 「登记失败」（外部项目总控实战反馈，v0.4.1 文案补强）。
+func TestColumnRegisterIdentityAnchor404(t *testing.T) {
+	addr := startRegTestServer(t)
+	ctx := context.Background()
+
+	// 踩坑形态：--column 填目标新栏目号 13（未登记）→ 404 自诊断文案透传，退 4。
+	_, stderr := runWantCode(t, "身份挂靠未登记栏目", 4, func() int {
+		return runColumnRegister(ctx, []string{
+			"--project", regAuthProject, "--column", "13",
+			"--session", regAuthSession, "--role", regAuthRole,
+			"--code", "13", "--name", "新栏目13",
+		}, addr)
+	})
+	for _, want := range []string{"column_not_found", "身份挂靠栏目 13 不存在", "目标栏目走 --code"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("身份挂靠 404 stderr = %q，期望含 %q（自诊断文案）", stderr, want)
+		}
+	}
+
+	// 正解形态：--column 挂已存在引导栏目 c01 + --code 声明新栏目 → 登记成功。
+	stdout, _ := runWantCode(t, "正解 register", 0, func() int {
+		return runColumnRegister(ctx, append(regIdentityArgs(),
+			"--project", regAuthProject, "--code", "13", "--name", "新栏目13"), addr)
+	})
+	if got := "OK column=13 id="; !strings.Contains(stdout, got) {
+		t.Errorf("正解 column register 输出 = %q，期望含 %q", stdout, got)
+	}
+}
+
 // TestColumnFamily AC2.4：column register/update/archive/list 同型（镜像 project 族）；
 // 重复登记退出 4；归档后默认 list 不可见、--all 可见。
 func TestColumnFamily(t *testing.T) {

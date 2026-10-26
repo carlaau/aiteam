@@ -111,9 +111,14 @@ curl -X POST http://<服务机>:8310/api/v1/projects/proj-a/columns -H "Content-
 #    自举后勿重放 register（409 project_exists）；补挂会话身份+补中文名用幂等 update：
 aiteam project update --code proj-a --name "示例项目" …
 aiteam column update --project proj-a --code 05 --name "S4 写码" …
-#    3b. 非空库（服务端已有项目/栏目）：直接 CLI 登记，身份四参填你所属的已存在栏目
-aiteam project register --code proj-a --name "示例项目" …
-aiteam column register --project proj-a --code 05 --name "S4 写码" …
+#    3b. 非空库（服务端已有项目/栏目）：直接 CLI 登记——「登记什么」与「挂在哪里」
+#    分开：目标统一走 --code，身份四参挂你所属的**已存在**域（--project/--column 均
+#    须已登记）。--column=身份挂靠位：登记新栏目时勿把新栏目号填进 --column（会被
+#    404「身份挂靠栏目 <code> 不存在」挡下，文案附正解指引）：
+aiteam project register --project <已存在项目> --column <已存在栏目> --session <会话名> --role controller --code proj-a --name "示例项目"
+aiteam column register --project proj-a --column <proj-a 内已存在栏目> --session <会话名> --role controller --code 05 --name "S4 写码"
+#    （新项目尚无任何栏目可挂靠时，其**首栏目**仍走 3a 的 curl 建档再 update 补名——
+#    column register 的身份 --column 须挂父项目内已存在栏目，无栏目即无 CLI 路径）
 
 # 4) 身份四参规约（信箱按 role 分格、一格一人；规约外值服务端拒收 invalid_role）
 #    controller        总控，单值
@@ -239,13 +244,18 @@ aiteam project update --code proj-a --name "示例项目" \
   --project proj-a --column 05 --session controller-A --role controller
 aiteam column update --project proj-a --code 05 --name "S4 写码" \
   --project proj-a --column 05 --session controller-A --role controller
-#     非空库（服务端已有项目/栏目）则直接 CLI 登记即可：
-#     aiteam project register --code proj-a --name "示例项目" \
-#       --project proj-a --column 05 --session controller-A --role controller
-#     aiteam column register --project proj-a --code 05 --name "S4 写码" …
+#     非空库（服务端已有项目/栏目）则直接 CLI 登记即可——身份四参挂你**已在**的域
+#     （--project/--column 均须已登记；目标统一走 --code，勿把待登记的新项目/新栏目
+#     号填进身份位）：
+#     aiteam project register --project <已存在项目> --column <已存在栏目> \
+#       --session controller-A --role controller --code proj-a --name "示例项目"
+#     aiteam column register --project proj-a --column <proj-a 内已存在栏目> \
+#       --session controller-A --role controller --code 05 --name "S4 写码"
+#     （新项目的**首栏目**无 CLI 路径——身份 --column 须挂父项目内已存在栏目，
+#     新项目无栏目可挂，仍走上面的 curl 建档再 update 补名）
 ```
 
-> **`--code` 撞名坑**：`project register` 的目标参数是 `--code`（待登记项目 code），**不是** `--project`——身份四参已占用 `--project`（操作者所在域），目标项目/栏目统一走 `--code`。column 族同理：`--project <父项目> --code <栏目code>`，其中 `--project` 一参两用（身份项目=父项目，同值自洽）。
+> **`--code` 撞名坑**：`project register` 的目标参数是 `--code`（待登记项目 code），**不是** `--project`——身份四参已占用 `--project`（操作者所在域），目标项目/栏目统一走 `--code`。column 族同理：`--project <父项目> --code <栏目code>`，其中 `--project` 一参两用（身份项目=父项目，同值自洽）；但 **`--column` 无此同值自洽**——它是身份挂靠位，须填父项目下**已存在**的栏目（新项目尚无栏目时其首栏目走 curl 建档）。把待登记的新栏目号填进 `--column` 不会命中目标，而是被心跳中间件 404 `column_not_found`「身份挂靠栏目 \<code\> 不存在——…目标栏目走 --code」挡下（自诊断文案，v0.4.1 起）。
 
 ```bash
 # 4.2 首次双会话实操（AI 会话版——总控窗与执行者窗各贴一块，拿来即用）
@@ -451,7 +461,7 @@ aiteam init --project <项目code> --name "<项目名>"
 | `recall` | 未消费窗口内撤回自己发的 direct/chat 消息（bus/block/receipt 不可撤） | `--seq <n>` 必填（要撤回的消息序号）；`--reason <text>` 可选（审计留痕） |
 | **登记族（项目 / 栏目 / 会话 / 审计）** | | |
 | `project register / update / archive / unarchive / list` | 项目登记 / 修改 / 注销 / 软删恢复（幂等）/ 查询 | 目标参数 `--code`（见上文撞名坑）；`--name`；`--heartbeat-timeout` 项目级失联阈值；`--all` |
-| `column register / update / archive / unarchive / list` | 栏目登记 / 修改 / 注销 / 软删恢复（幂等）/ 查询 | `--project`（一参两用：身份项目=父项目）；`--code`；`--name` |
+| `column register / update / archive / unarchive / list` | 栏目登记 / 修改 / 注销 / 软删恢复（幂等）/ 查询 | `--project`（一参两用：身份项目=父项目）；`--column`=身份挂靠位（**须已存在**，非目标栏目）；`--code`（目标栏目，见上文撞名坑）；`--name` |
 | `session list` | 会话心跳面（在线 / 失联 + 哨兵活性） | `--project`（兼作过滤） |
 | `audit` | 登记类操作留痕查询 | `--action`；`--limit` |
 | **资源与调度** | | |

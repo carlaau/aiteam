@@ -212,14 +212,16 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	if err := c.Do(ctx, http.MethodPost, "/api/v1/messages", payload, &resp); err != nil {
 		// 跨项目 404 project_not_found 特判（b5-W3，§4.2 冻结文案）：该码有两个
 		// 发射源——目标域（跨项目解析「项目不存在: <目标code>」）与身份域（心跳
-		// 中间件「项目未登记: <发送方project>」，发送方自身项目未登记）。带
-		// --to-project 时身份域坏项目同样命中该码，故按冻结文案前缀判别归因：
-		// 身份域回落 fail(err) 透传（真实病因=自身项目拼错，不被「目标项目不
-		// 存在」误报吞掉，AC9.2 指明真实缺失层级）；目标域照旧特判输出冻结文案
-		//「目标项目不存在: X」。退出码仍为 4——APIError 既有域，零新增（§4.4）。
+		// 中间件「身份挂靠项目 <发送方project> 不存在…」，M-40 自诊断文案，发送
+		// 方自身项目未登记）。带 --to-project 时身份域坏项目同样命中该码，故按
+		// 文案前缀判别归因：身份域回落 fail(err) 透传（真实病因=自身项目拼错，
+		// 不被「目标项目不存在」误报吞掉，AC9.2 指明真实缺失层级）；目标域照旧
+		// 特判输出冻结文案「目标项目不存在: X」。退出码仍为 4——APIError 既有
+		// 域，零新增（§4.4）。CLI 与 serve 同二进制发布，前缀与中间件文案同步
+		// 演进（v0.4.1 M-40），无版本偏差兼容负担。
 		var ae *client.APIError
 		if target.project != "" && errors.As(err, &ae) && ae.Code == types.CodeProjectNotFound &&
-			!strings.HasPrefix(ae.Message, "项目未登记") {
+			!strings.HasPrefix(ae.Message, "身份挂靠项目") {
 			fmt.Fprintf(os.Stderr, "ERROR: 目标项目不存在: %s\n", target.project)
 			return 4
 		}

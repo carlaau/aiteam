@@ -212,8 +212,9 @@ func TestMissingHeaders(t *testing.T) {
 
 // ---- ② 存在性校验（AC2.2：未登记 → 404，错误信息指明；短路不 upsert） ----
 
-// TestProjectNotFound 未登记项目 → 404 project_not_found + 错误信息含项目 code；
-// 404 短路，不写 sessions。
+// TestProjectNotFound 未登记项目 → 404 project_not_found + 自诊断文案
+// 「身份挂靠项目 <code> 不存在」（M-40：指明身份挂靠位语义+register 指引，
+// 防误读目标项目登记失败）；404 短路，不写 sessions。
 
 func TestProjectNotFound(t *testing.T) {
 	h, st := newTestEnv(t)
@@ -222,17 +223,18 @@ func TestProjectNotFound(t *testing.T) {
 	rr := doHeartbeatReq(t, h, http.MethodGet, "/api/v1/no-such-endpoint", "nope", "05", "executor-A", "executor")
 
 	wantErrBody(t, rr, http.StatusNotFound, types.CodeProjectNotFound)
-	if msg := errMsg(t, rr); !strings.Contains(msg, "nope") {
-		t.Errorf("错误信息 %q 不含项目 code %q（AC2.2 指明语义）", msg, "nope")
+	if msg := errMsg(t, rr); !strings.Contains(msg, "身份挂靠项目 nope 不存在") {
+		t.Errorf("错误信息 %q 不含自诊断文案「身份挂靠项目 nope 不存在」（M-40，AC2.2 指明语义）", msg)
 	}
 	if n := countTable(t, st, "sessions"); n != 0 {
 		t.Errorf("404 短路后 sessions 行数 = %d，期望 0（未登记拒绝不 upsert）", n)
 	}
 }
 
-// TestColumnNotFound 栏目未登记两形态 → 404 column_not_found + 错误信息含栏目
-// code：①栏目 code 全库不存在；②栏目 code 在其他项目存在（UNIQUE 按项目隔离，
-// JOIN 限定 project_id 不得跨项目误命中）；404 短路不写 sessions。
+// TestColumnNotFound 栏目未登记两形态 → 404 column_not_found + 自诊断文案
+// 「身份挂靠栏目 <code> 不存在…register 新栏目时 --column 挂已存在栏目位，目标
+// 栏目走 --code」（M-40）：①栏目 code 全库不存在；②栏目 code 在其他项目存在
+// （UNIQUE 按项目隔离，JOIN 限定 project_id 不得跨项目误命中）；404 短路不写 sessions。
 
 func TestColumnNotFound(t *testing.T) {
 	h, st := newTestEnv(t)
@@ -245,8 +247,14 @@ func TestColumnNotFound(t *testing.T) {
 	} {
 		rr := doHeartbeatReq(t, h, http.MethodGet, "/api/v1/no-such-endpoint", tc.proj, tc.col, "executor-A", "executor")
 		wantErrBody(t, rr, http.StatusNotFound, types.CodeColumnNotFound)
-		if msg := errMsg(t, rr); !strings.Contains(msg, tc.col) {
-			t.Errorf("[%s] 错误信息 %q 不含栏目 code %q（AC2.2 指明语义）", tc.name, msg, tc.col)
+		msg := errMsg(t, rr)
+		for _, want := range []string{
+			"身份挂靠栏目 " + tc.col + " 不存在",
+			"目标栏目走 --code",
+		} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("[%s] 错误信息 %q 不含 %q（M-40 自诊断，AC2.2 指明语义）", tc.name, msg, want)
+			}
 		}
 	}
 	if n := countTable(t, st, "sessions"); n != 0 {
