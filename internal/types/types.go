@@ -52,6 +52,11 @@ const (
 // target_session_not_found 专属码，两码语义分立）。
 // CodeAgentConflict 为 2026-10-03 增补令新增（role 规约闸，技术设计 §2.2 #9
 // 已同步）：direct 目标格子 ≥2 活会话拒投，归 §2.4 409「语义冲突/状态拒绝」组。
+// CodeSessionAmbiguous 为 §2.4 409「语义冲突/状态拒绝」族 additive 新码（b2/
+// M-42）：多栏同名会话解析歧义显式报错（send chat 目标解析与 poll/ack 消费视角
+// 共用），§2.4 总表待收口回写。定 409 不用 404 的理由：404 族语义是「目标未注册
+// 不存在」（target_session_not_found/session_not_found），歧义=同名行存在多个，
+// 语义分立——409 Conflict 语义冲突组与 agent_conflict（同格多活会话拒投）同构。
 const (
 	CodeRoleInvalid           = "role_invalid"             // direct 目标角色空白（400）
 	CodeBodyEmpty             = "body_empty"               // 消息正文为空（400）
@@ -60,6 +65,7 @@ const (
 	CodeColumnArchived        = "column_archived"          // 栏目已归档，收发拒绝（409，AC2.3）
 	CodeSessionNotFound       = "session_not_found"        // 消费视角会话未注册（404，§2.4 404 族）
 	CodeAgentConflict         = "agent_conflict"           // direct 目标格子 ≥2 活会话拒投（409，2026-10-03 增补·role 规约闸）
+	CodeSessionAmbiguous      = "session_ambiguous"        // 多栏同名会话解析歧义（409，§2.4 409 族 additive 新码，b2/M-42）
 )
 
 // B2-5 回执/历史错误码（§2.4 逐字面量）：#12 特有语义二码。already_recepted
@@ -92,9 +98,21 @@ type DataResponse struct {
 }
 
 // ErrorBody 错误明细（§2.1）：code=机器码（§2.4 枚举），message=人类可读中文。
+// holder=additive 退位诊断（v0.4.2 M-41 起，仅 poll 404「行不存在且同坐标有活哨兵」
+// 附着；omitempty——其余错误响应恒缺省此键，旧客户端解析未知键零感知）。
 type ErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Holder  *HolderInfo `json:"holder,omitempty"`
+}
+
+// HolderInfo 错误响应附着的持有者诊断（v0.4.2 M-41 poll 404 退位自诊断）：wire 形状
+// 与 register 200 幂等命中 data.holder 同形（session/last_ping_at/age_sec）——
+// additive 键，旧客户端解析未知键零感知。
+type HolderInfo struct {
+	Session    string `json:"session"`
+	LastPingAt string `json:"last_ping_at"`
+	AgeSec     int64  `json:"age_sec"`
 }
 
 // ErrorResponse 错误响应统一包裹（§2.1）：{"error": {...}}，HTTP 4xx/5xx。
@@ -125,6 +143,13 @@ func WriteData(w http.ResponseWriter, status int, v any) {
 // WriteError 输出错误响应（§2.1 错误形状）：code 为 §2.4 机器码，msg 为人类可读中文。
 func WriteError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, ErrorResponse{Error: ErrorBody{Code: code, Message: msg}})
+}
+
+// WriteErrorBody 输出带扩展错误体的错误响应（v0.4.2 M-41 起）：WriteError 的
+// additive 超集——无扩展键（holder=nil）时 wire 形状与 WriteError 完全一致；
+// 既有 WriteError 调用面（约 50 处）签名与输出零变化。
+func WriteErrorBody(w http.ResponseWriter, status int, body ErrorBody) {
+	writeJSON(w, status, ErrorResponse{Error: body})
 }
 
 // writeJSON 序列化并写出 JSON 响应体。Marshal 失败理论上不可达（载荷均为

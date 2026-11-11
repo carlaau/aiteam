@@ -196,6 +196,10 @@ type APIError struct {
 	StatusCode int    // HTTP 状态码
 	Code       string // 机器码（§2.4）；非标准错误体兜底时为空串
 	Message    string // 人类可读信息；非标准错误体时为原始响应片段（截断）
+	// Holder 错误体 additive 键附带（v0.4.2 M-41 退位自诊断；T1 服务端 poll 404
+	// 错误体附带现任持有者）经此透传给 CLI 特判渲染面；不进 Error() 文本——
+	// nil=服务端未附（旧服务端/其余错误恒缺省此键，解析零感知）。
+	Holder *types.HolderInfo
 }
 
 func (e *APIError) Error() string {
@@ -206,11 +210,13 @@ func (e *APIError) Error() string {
 }
 
 // decodeAPIError 把非 2xx 响应体解析为 *APIError：标准 {"error":{code,message}}
-// 形状逐字段透传；非标准形状（反代 HTML 等）兜底保留状态码+原始片段，不静默丢弃。
+// 形状逐字段透传（holder additive 键一并带入 APIError.Holder——旧服务端无此键
+// 时保持 nil 零感知，消费面 CLI 侧特判渲染）；非标准形状（反代 HTML 等）兜底
+// 保留状态码+原始片段不静默丢弃，Holder 恒 nil。
 func decodeAPIError(status int, body []byte) *APIError {
 	var er types.ErrorResponse
 	if err := json.Unmarshal(body, &er); err == nil && er.Error.Code != "" {
-		return &APIError{StatusCode: status, Code: er.Error.Code, Message: er.Error.Message}
+		return &APIError{StatusCode: status, Code: er.Error.Code, Message: er.Error.Message, Holder: er.Error.Holder}
 	}
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 200 {

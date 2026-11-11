@@ -191,9 +191,26 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 			for i, a := range alive {
 				names[i] = a.Name
 			}
+			// 自指提示（b2-T7/M-43②）：发送方 id=sessionIDFromCtx（心跳中间件
+			// 本请求刚 upsert 进来的会话行，⑤ 落库归因同源注入面），按会话 id
+			// 精确判定名单是否含发送方自己——上文「含自己在格子」读法（发送方
+			// 计入格子活会话数）的用户可见半面：格里有自己却不知何故，此处教学。
+			// 跨项目变体目标域内的同名行是独立 sessions 行（id≠发送方 id）不触发
+			// （红笔锚 3 守，禁按名字判定）；名单不含发送方 → selfHint 空串，
+			// 文案与现状逐字节不变（红笔锚 2 守）。拼接位置=教学语主体之后、
+			// agentConflictClearing 逐会话清障段之前（教学语族相邻，clearing
+			// 明细保持最尾）。
+			senderID := sessionIDFromCtx(r.Context())
+			selfHint := ""
+			for _, a := range alive {
+				if a.ID == senderID {
+					selfHint = fmt.Sprintf("；名单中 %s 是你本次 --column 声明注册进来的；若本意是跨栏目投递请改用 --bus（或 --to-column）", a.Name)
+					break
+				}
+			}
 			types.WriteError(w, http.StatusConflict, types.CodeAgentConflict,
-				fmt.Sprintf("%s存在 %d 个活会话（%s），请个体化命名 executor_<标识> 或改用 --bus 广播%s",
-					cell, len(alive), strings.Join(names, "、"), agentConflictClearing(alive)))
+				fmt.Sprintf("%s存在 %d 个活会话（%s），请个体化命名 executor_<标识> 或改用 --bus 广播%s%s",
+					cell, len(alive), strings.Join(names, "、"), selfHint, agentConflictClearing(alive)))
 			return
 		}
 		in = store.MessageInput{Kind: store.MessageKindDirect, ColumnID: targetRef.ColumnID, TargetRole: role}
@@ -239,7 +256,35 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 			sessProjID = tp.ID
 			sessProjCode = targetProj
 		}
-		target, err := s.st.GetSessionByName(sessProjID, targetSess)
+		// M-42 偏好锚选择（解析时发送方所在栏优先匹配）：项目内变体=发送方所在
+		// 栏（senderRef.ColumnID——同名会话多栏注册时，发送方栏内同名行即意图
+		// 目标）；跨项目变体发送方栏不在目标项目域 → prefer=0 无偏好锚（全项目
+		// 同名多行直接 409 歧义）。往返账：偏好命中 1 SELECT 零变化；仅未命中
+		// 路径 +1 SELECT（见 store GetSessionByName doc）。
+		prefer := int64(0)
+		if !crossProject {
+			prefer = senderRef.ColumnID
+		}
+		target, err := s.st.GetSessionByName(sessProjID, prefer, targetSess)
+		// M-42 消歧语义：同名多行且偏好锚未命中 → 409 session_ambiguous 显式
+		// 报错（不再静默取最早行——旧病灶=watch 哨兵 chat 命中静默失效）。特判
+		// 在 ErrSessionNotFound 之外（两错误互斥：歧义=同名存在多行，未注册=
+		// 不存在，语义分立——409 不用 404 的理由见 types CodeSessionAmbiguous 注）；
+		// 拒绝发生在目标解析步、InsertMessage 前（拒绝不落库）。文案风格对齐
+		// agent_conflict 名单「、」join（ambiguousRefsList 单点渲染）。
+		var amb *store.AmbiguousSessionError
+		if errors.As(err, &amb) {
+			if crossProject {
+				types.WriteError(w, http.StatusConflict, types.CodeSessionAmbiguous,
+					fmt.Sprintf("目标项目 %s 内会话 %s 存在 %d 个同名会话（%s）——请先治理同名会话行（或改用 direct 定向）",
+						targetProj, targetSess, len(amb.Refs), ambiguousRefsList(amb)))
+			} else {
+				types.WriteError(w, http.StatusConflict, types.CodeSessionAmbiguous,
+					fmt.Sprintf("目标会话 %s 在项目内存在 %d 个同名会话（%s），且发送方栏目 %s 内无同名行——请先治理同名会话行（或改用 direct --to-role 定向）",
+						targetSess, len(amb.Refs), ambiguousRefsList(amb), colCode))
+			}
+			return
+		}
 		if errors.Is(err, store.ErrSessionNotFound) {
 			// b4-T3/R3 近邻建议段：目标域会话名清单（≤5，`名称@role`，chatNearbyHint）
 			// 追加在既有文案后；零近邻零段（文案与现状逐字节同）。建议域裁量留痕

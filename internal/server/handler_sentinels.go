@@ -55,20 +55,14 @@ func sentinelTimeoutSec(cfg *config.ServerConfig) int64 {
 
 // SentinelRegisterData #14 响应载荷（§2.2 #14：interval_sec=生效值回显——缺省时为
 // 服务配置值，显式传入时为请求值）。b8-W2：幂等命中（200）增 holder 持有者诊断
-// （omitempty——201 新建/接管路径无此键，响应面 additive 向后兼容）。
+// （omitempty——201 新建/接管路径无此键，响应面 additive 向后兼容）。b1-T1 起
+// 元素类型收敛为 types.HolderInfo（原本地 SentinelHolderData 删除，b8-W2①语义
+// 迁往 types 单一来源）——与 poll 404 退位诊断同构（json tag 同名，wire 形状零
+// 变化，b8-W2 既有 200 holder 测试按 wire 断言保持绿）。
 type SentinelRegisterData struct {
-	SentinelID  int64               `json:"sentinel_id"`
-	IntervalSec int64               `json:"interval_sec"`
-	Holder      *SentinelHolderData `json:"holder,omitempty"`
-}
-
-// SentinelHolderData 幂等命中的持有者诊断（b8-W2①）：session=持有者会话名、
-// last_ping_at=既有行 ping 时刻、age_sec=now−last_ping_at（types.NowUTC 同源钟，
-// CLI 侧从响应值渲染不自行取时钟）。
-type SentinelHolderData struct {
-	Session    string `json:"session"`
-	LastPingAt string `json:"last_ping_at"`
-	AgeSec     int64  `json:"age_sec"`
+	SentinelID  int64             `json:"sentinel_id"`
+	IntervalSec int64             `json:"interval_sec"`
+	Holder      *types.HolderInfo `json:"holder,omitempty"`
 }
 
 // SentinelPollData #15 响应载荷（§2.2 #15：hits 空=未命中继续睡；now=服务端注入时钟）。
@@ -205,7 +199,7 @@ func (s *Server) handleSentinelRegister(w http.ResponseWriter, r *http.Request) 
 		types.WriteData(w, http.StatusOK, SentinelRegisterData{
 			SentinelID:  h.ID,
 			IntervalSec: interval,
-			Holder:      &SentinelHolderData{Session: h.Session, LastPingAt: h.LastPingAt, AgeSec: h.AgeSec},
+			Holder:      &types.HolderInfo{Session: h.Session, LastPingAt: h.LastPingAt, AgeSec: h.AgeSec},
 		})
 		return
 	}
@@ -269,6 +263,28 @@ func (s *Server) handleSentinelPoll(w http.ResponseWriter, r *http.Request) {
 	now := types.NowUTC()
 	if err := s.st.PingSentinelWithHeartbeat(sentinelID, loc.SessionID, now); err != nil {
 		if errors.Is(err, store.ErrSentinelNotFound) {
+			// b1-T1 退位自诊断（M-41 双 force 顶替）：行不存在且同坐标有活哨兵
+			// （现任持有者）→ 404 错误体 additive 附 holder（会话名/ping 时刻/年龄
+			// ——「正常退位」与「接管失败」可辨），code/message 原文案逐字不变；
+			// register 200 幂等命中 holder 先例同款 additive 键，旧客户端零感知。
+			// 账面：+1 SELECT 仅发生在本 404 错误分支，正常 poll 往返账零变化；
+			// id 非数字 404（解析即拒）与 DELETE 404（无坐标可定位）不附 holder；
+			// 同坐标查无活哨兵 → 原样 404（无 holder，负面锚契约）。now 与上方
+			// ping 同源同刻（types.NowUTC 单取），age_sec 口径与 register 200 一致
+			// （types.NowUTC 同源钟，CLI 侧从响应值渲染不自行取时钟）。
+			h, alive, qerr := s.st.FindAliveSentinel(loc.SessionID, loc.ColumnID, qRole, now, sentinelTimeoutSec(s.cfg))
+			if qerr != nil {
+				types.WriteError(w, http.StatusInternalServerError, codeInternalError, "服务内部错误")
+				return
+			}
+			if alive {
+				types.WriteErrorBody(w, http.StatusNotFound, types.ErrorBody{
+					Code:    codeSentinelNotFound,
+					Message: "哨兵不存在或已注销",
+					Holder:  &types.HolderInfo{Session: h.Session, LastPingAt: h.LastPingAt, AgeSec: h.AgeSec},
+				})
+				return
+			}
 			types.WriteError(w, http.StatusNotFound, codeSentinelNotFound, "哨兵不存在或已注销")
 			return
 		}

@@ -49,6 +49,17 @@ func rejectArchivedColumn(w http.ResponseWriter, colStatus, projCode, colCode st
 	return true
 }
 
+// ambiguousRefsList M-42 歧义候选清单渲染（send chat 项目内/跨项目 409 与消费
+// 视角 409 三文案共用单点）：逐候选「名称@栏目code」、「、」join——风格对齐
+// agent_conflict 活会话名单（红笔锚 2/3/4 断言片段 executor-B@05 形态的来源）。
+func ambiguousRefsList(e *store.AmbiguousSessionError) string {
+	items := make([]string, len(e.Refs))
+	for i, r := range e.Refs {
+		items[i] = r.Name + "@" + r.ColumnCode
+	}
+	return strings.Join(items, "、")
+}
+
 // ---- #10 GET /api/v1/mailbox + #11 POST /api/v1/acks（B2-4）----
 
 // messageSenderData #10 响应 sender 身份三件（§2.2 #10 响应结构逐字段：
@@ -127,7 +138,20 @@ func (s *Server) resolveMailboxDomain(w http.ResponseWriter, r *http.Request, re
 		return ref, "", 0, false
 	}
 	if sess := strings.TrimSpace(r.URL.Query().Get("session")); sess != "" {
-		se, err := s.st.GetSessionByName(ref.ProjectID, sess)
+		// M-42 偏好锚=消费视角栏目（ref.ColumnID，query column 参数定位的栏目）
+		// ——与 send chat 发送方栏偏好同构：锚内同名行优先命中，锚外单行回落，
+		// 全项目同名多行且锚未命中→409 显式歧义（不再静默取最早行）。往返账与
+		// send 同款知情权衡（仅未命中路径 +1 SELECT，见 store GetSessionByName doc）。
+		// 下方既有 404 session_not_found 分支语义逐字节不动（未注册=不存在与
+		// 歧义=多行语义分立，AmbiguousSessionError 不落该分支）。
+		se, err := s.st.GetSessionByName(ref.ProjectID, ref.ColumnID, sess)
+		var amb *store.AmbiguousSessionError
+		if errors.As(err, &amb) {
+			types.WriteError(w, http.StatusConflict, types.CodeSessionAmbiguous,
+				fmt.Sprintf("消费视角会话 %s 存在 %d 个同名会话（%s），且栏目 %s 内无同名行——请指定确切栏目或治理同名会话行",
+					sess, len(amb.Refs), ambiguousRefsList(amb), colCode))
+			return ref, "", 0, false
+		}
 		if errors.Is(err, store.ErrSessionNotFound) {
 			types.WriteError(w, http.StatusNotFound, types.CodeSessionNotFound, "消费视角会话未注册: "+sess)
 			return ref, "", 0, false

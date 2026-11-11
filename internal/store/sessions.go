@@ -275,36 +275,126 @@ func (s *Store) GetSendersByIDs(ids []int64) (map[int64]SenderRef, error) {
 	return out, nil
 }
 
-// GetSessionByName 按（项目 id, 会话名）定位目标会话（§2.2 #9 chat 形态数据面，
-// B2-3）：send handler 用其 id/target_session_id 与 column_id（chat 消息归属=
-// 目标会话栏目，§3.2 表 5 注），并随同一查询带回目标栏目 code/status 供 handler
-// 判 archived→409 column_archived（AC2.3——不带回则 chat 缺目标栏目归档校验，
-// 消息会落进 archived 栏目且 poll 可拉；一次 JOIN 带回，免第二次域读往返）。
-// sessions 仅 (project_id, column_id, name) 唯一——同名跨栏目多实体行时取最早
-// 实体行（ORDER BY id LIMIT 1；规格未定义同名定位口径，此为防御性确定性兜底）。
-// 未命中返回 ErrSessionNotFound（handler 映射 404 target_session_not_found
-// 专属口，不经 writeStoreError——write_store_error_test.go 清单二口径）。
+// SessionColumnRef 同名歧义候选行引用（M-42 AmbiguousSessionError 清单元素）：
+// 会话名+所属栏目 code，供 handler 渲染「名称@栏目code」候选清单（409
+// session_ambiguous 消息体，风格对齐 agent_conflict 名单）。
+type SessionColumnRef struct {
+	Name       string
+	ColumnCode string
+}
+
+// AmbiguousSessionError 多栏同名会话解析歧义（M-42，b2-T1 绿笔新增）：项目内
+// 同名会话 ≥2 行且栏位偏好锚未命中时由 GetSessionByName 返回，取代旧版
+// 「ORDER BY id LIMIT 1 最早行静默胜出」（病灶=watch 哨兵 chat 命中静默失效，
+// bf51ef8 立档）。消费方用 errors.As(*AmbiguousSessionError) 特判→409
+// session_ambiguous（additive 新码，§2.4 409 族，b2/M-42）。
+//
+// 不进 writeStoreError 默认映射（同 ErrSessionNotFound 先例——后者由 chat
+// 形态 handler errors.Is 专属口消费，write_store_error_test.go 清单二刻意不
+// 映射落 default 500）：本类型带结构化候选清单，错误→HTTP 语义的映射分场景
+// （send chat 项目内/跨项目文案不同、消费视角又异），通用映射无法承载；两既有
+// 调用点均特判，未来未特判调用点落 default 500 兜底（slog 带全文可排查）。
+// Error() 文案含会话名、候选数与候选清单（500 兜底与日志场景的自足描述）。
+type AmbiguousSessionError struct {
+	Name string             // 歧义会话名
+	Refs []SessionColumnRef // 项目内全部同名行候选（s.id 注册序）
+}
+
+func (e *AmbiguousSessionError) Error() string {
+	items := make([]string, len(e.Refs))
+	for i, r := range e.Refs {
+		items[i] = r.Name + "@" + r.ColumnCode
+	}
+	return fmt.Sprintf("会话 %q 存在 %d 个同名会话（%s），无栏位锚不可定位", e.Name, len(e.Refs), strings.Join(items, "、"))
+}
+
+// GetSessionByName 按（项目 id, 栏位偏好, 会话名）定位目标会话（§2.2 #9 chat
+// 形态数据面，B2-3；M-42 消歧改造）：send handler 用其 id/target_session_id 与
+// column_id（chat 消息归属=目标会话栏目，§3.2 表 5 注），并随同一查询带回目标
+// 栏目 code/status 供 handler 判 archived→409 column_archived（AC2.3——不带回
+// 则 chat 缺目标栏目归档校验，消息会落进 archived 栏目且 poll 可拉；一次 JOIN
+// 带回，免第二次域读往返）。
+//
+// 解析口径四态（M-42 定案，取代旧版「(project_id,name) 无栏位约束+ORDER BY id
+// LIMIT 1 最早行静默胜出」）：
+//   - 偏好命中：preferColumnID>0 时先查 (project_id, column_id, name) 三元组
+//     （UNIQUE 约束保单行）——命中即用不查全项目（发送方所在栏优先匹配：同名
+//     会话在多栏注册时，发送方栏内同名行即意图目标）；
+//   - 回落单行：偏好未命中（或 preferColumnID<=0=无偏好锚，跨项目变体用——
+//     发送方栏不在目标项目域）→ 查全项目同名行，恰 1 行 → 命中（旧行为在单行
+//     场景的逐字节不变，红笔锚 5 负面锚守）；
+//   - 歧义：全项目同名 ≥2 行 → 返回 *AmbiguousSessionError（含候选清单，handler
+//     特判 409 session_ambiguous 显式报错，不再静默取最早行）；
+//   - 未存在：0 行 → ErrSessionNotFound（%w 包装文案照旧，handler 映射 404
+//     target_session_not_found 专属口，不经 writeStoreError——
+//     write_store_error_test.go 清单二口径）。
+//
+// DB 往返账（热路径知情权衡）：偏好命中=1 SELECT（与旧版单查询持平，零变化）；
+// 仅未命中路径 +1 SELECT（偏好查询落空后再发回落查询），与 M-41 poll 404 错误
+// 分支 +1 SELECT 同型——错误/未命中分支非热路径，换歧义显式化知情接受。
 // 不复用 sessionColumns/sessionFrom：后者筛 p.status='active' 且带失联计算列
 // 占位符，而本查询须能定位 archived 栏目中的会话（先 404 存在性、后 409 归档，
 // 存在性优先）且保持最轻读面（不 JOIN projects、不算失联列；FK 保证栏目行
-// 存在，INNER JOIN 不丢行）。
-func (s *Store) GetSessionByName(projectID int64, name string) (Session, error) {
-	var se Session
-	err := s.DB.QueryRow(
+// 存在，INNER JOIN 不丢行）。两段查询（偏好三元组/回落全项目）SELECT 面一致
+// （id/column_id/name + JOIN columns 带回 code/status），回落单行命中与偏好
+// 命中返回同一装配形态。
+func (s *Store) GetSessionByName(projectID, preferColumnID int64, name string) (Session, error) {
+	if preferColumnID > 0 {
+		var se Session
+		err := s.DB.QueryRow(
+			`SELECT s.id, s.column_id, s.name, c.code, c.status
+			 FROM sessions s
+			 JOIN columns c ON c.id = s.column_id
+			 WHERE s.project_id = ? AND s.column_id = ? AND s.name = ?`,
+			projectID, preferColumnID, name,
+		).Scan(&se.ID, &se.ColumnID, &se.Name, &se.ColumnCode, &se.ColumnStatus)
+		if err == nil {
+			return se, nil // 偏好命中即用，不查全项目（热路径 1 SELECT 零变化）
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Session{}, fmt.Errorf("store: 按栏位偏好查询会话 %q 失败: %w", name, err)
+		}
+		// 偏好未命中 → 回落全项目同名行解析（下方）。
+	}
+	rows, err := s.DB.Query(
 		`SELECT s.id, s.column_id, s.name, c.code, c.status
 		 FROM sessions s
 		 JOIN columns c ON c.id = s.column_id
 		 WHERE s.project_id = ? AND s.name = ?
-		 ORDER BY s.id LIMIT 1`,
+		 ORDER BY s.id`,
 		projectID, name,
-	).Scan(&se.ID, &se.ColumnID, &se.Name, &se.ColumnCode, &se.ColumnStatus)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Session{}, fmt.Errorf("%w: 项目 id=%d 会话 %q", ErrSessionNotFound, projectID, name)
-	}
+	)
 	if err != nil {
 		return Session{}, fmt.Errorf("store: 按名查询会话 %q 失败: %w", name, err)
 	}
-	return se, nil
+	defer rows.Close()
+	var (
+		first Session // 恰 1 行时的命中行（=旧行为 ORDER BY id LIMIT 1 的唯一行）
+		refs  []SessionColumnRef
+		n     int
+	)
+	for rows.Next() {
+		var se Session
+		if err := rows.Scan(&se.ID, &se.ColumnID, &se.Name, &se.ColumnCode, &se.ColumnStatus); err != nil {
+			return Session{}, fmt.Errorf("store: 扫描同名会话行 %q 失败: %w", name, err)
+		}
+		n++
+		if n == 1 {
+			first = se
+		}
+		refs = append(refs, SessionColumnRef{Name: se.Name, ColumnCode: se.ColumnCode})
+	}
+	if err := rows.Err(); err != nil {
+		return Session{}, fmt.Errorf("store: 遍历同名会话行 %q 失败: %w", name, err)
+	}
+	switch n {
+	case 0:
+		return Session{}, fmt.Errorf("%w: 项目 id=%d 会话 %q", ErrSessionNotFound, projectID, name)
+	case 1:
+		return first, nil
+	default:
+		return Session{}, &AmbiguousSessionError{Name: name, Refs: refs}
+	}
 }
 
 // SessionNameRole 会话名+角色二元组（chat 404 近邻建议段数据面，b4-T3/R3——
@@ -414,12 +504,16 @@ func (s *Store) ListSessions(projectCode, now string, defaultTimeoutSec int) ([]
 
 // AliveSession 目标格子一个活会话的数据面（#9 agent_conflict 409 清障段数据源，
 // b2-T2/R4——last_seen 扩展择「结构体化」：并行切片需调用方按下标对齐两数组，
-// 结构体自携带对齐关系）。Name 供名单+清障段逐会话行；LastSeenAt=心跳时间戳
-// 原文（ISO8601 UTC）；ElapsedSec=now−last_seen 秒差（判活谓词同款 strftime 算式
-// 于同一查询带回——展示值与判活值零漂移，handler 免二次解析）；TimeoutSec=判活
-// 所用项目级有效阈值 COALESCE(p.heartbeat_timeout_sec, 服务默认)（eta 数据源，
-// eta=TimeoutSec−ElapsedSec；格子限单项目，逐行恒同值，随查询带回免第二条域读）。
+// 结构体自携带对齐关系）。ID=sessions 行主键（409 自指判定消费，b2-T7/M-43②：
+// 名单含发送方自己按会话 id 精确判定——发送方行=心跳中间件本请求刚 upsert 的行，
+// 名字同名但属目标域独立行的 id≠发送方 id 不触发）；Name 供名单+清障段逐会话行；
+// LastSeenAt=心跳时间戳原文（ISO8601 UTC）；ElapsedSec=now−last_seen 秒差（判活
+// 谓词同款 strftime 算式于同一查询带回——展示值与判活值零漂移，handler 免二次
+// 解析）；TimeoutSec=判活所用项目级有效阈值 COALESCE(p.heartbeat_timeout_sec,
+// 服务默认)（eta 数据源，eta=TimeoutSec−ElapsedSec；格子限单项目，逐行恒同值，
+// 随查询带回免第二条域读）。
 type AliveSession struct {
+	ID         int64
 	Name       string
 	LastSeenAt string
 	ElapsedSec int
@@ -441,11 +535,16 @@ type AliveSession struct {
 // 返回形态变更留痕（b2-T2/R4，2026-10-25）：[]string → []AliveSession。全仓
 // 调用方先经 grep 核实=唯一生产调用点 handler_messages_send.go 409 分支（随
 // 本批同步适配）；测试侧仅注释提及，无调用。
+//
+// 返回形态变更留痕（b2-T7/M-43②，2026-11-12）：AliveSession 增 ID 字段、SELECT
+// 增 s.id 带回（Scan 同步）——additive 非破坏（唯一生产调用点同上；测试侧
+// TestListAliveSessionNamesLastSeen 整结构体相等比较随本批如实适配补 ID，
+// 断言语义零变化）。
 func (s *Store) ListAliveSessionNames(projectID, columnID int64, role, now string, defaultTimeoutSec int) ([]AliveSession, error) {
 	rows, err := s.DB.Query(
-		`SELECT s.name, s.last_seen_at,
-		       (strftime('%s', ?) - strftime('%s', s.last_seen_at)),
-		       COALESCE(p.heartbeat_timeout_sec, ?)
+		`SELECT s.id, s.name, s.last_seen_at,
+	       (strftime('%s', ?) - strftime('%s', s.last_seen_at)),
+	       COALESCE(p.heartbeat_timeout_sec, ?)
 		 FROM sessions s
 		 JOIN projects p ON p.id = s.project_id
 		 WHERE p.status = 'active'
@@ -462,7 +561,7 @@ func (s *Store) ListAliveSessionNames(projectID, columnID int64, role, now strin
 	out := make([]AliveSession, 0)
 	for rows.Next() {
 		var a AliveSession
-		if err := rows.Scan(&a.Name, &a.LastSeenAt, &a.ElapsedSec, &a.TimeoutSec); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.LastSeenAt, &a.ElapsedSec, &a.TimeoutSec); err != nil {
 			return nil, fmt.Errorf("store: 扫描活会话行失败: %w", err)
 		}
 		out = append(out, a)

@@ -852,3 +852,120 @@ func TestPollMarksSentinelLastHit(t *testing.T) {
 	}
 	wantHits(t, rr, [][2]any{{seq, "normal"}})
 }
+
+// ===== b1-T1（v0.4.2-b1/M-41）#15 poll 404 退位自诊断：断言先行（红笔） =====
+//
+// 目标契约（绿笔实现面）：行不存在且同坐标有活哨兵的 poll 404，error 对象 additive
+// 附 holder 退位诊断 {session,last_ping_at,age_sec}（与 #14 幂等命中 200 的 holder
+// 先例同构）；message 原文案逐字不变。无活哨兵/非数字 id/DELETE 端点的 404 不含
+// holder 键（旧客户端零感知）。
+
+// errObjOf 解出响应 error 对象（缺 error 或非对象即 Fatal）——b1-T1 三测共用。
+func errObjOf(t *testing.T, rr *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	m := decodeMap(t, rr)
+	errObj, ok := m["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("响应缺 error 对象: %s", rr.Body.String())
+	}
+	return errObj
+}
+
+// TestPollNotFoundHolderAfterTakeover M-41 核心场景：双 force 顶替——先发 watch 的
+// 哨兵行被后发 force 接管（同事务旧删新插）删除后，旧 id poll 得 404 sentinel_not_found，
+// 响应 additive 附 holder（现任持有者会话名/ping 时刻/年龄），退位与「接管失败」可辨。
+// 注入钟纪律：t0 注册、t1 接管、t1 poll——接管行 last_ping_at=接管时刻 t1 精确锚定，
+// age_sec=now−last_ping_at=0 恒定（types.NowUTC 同源钟，与 b8-W2① age_sec==5 同款精确口径）。
+func TestPollNotFoundHolderAfterTakeover(t *testing.T) {
+	h, st := newSentinelTestServer(t)
+	_, _, _ = fixtureSentinelDomain(t, st)
+	injectFixedClock(t, sentinelT0)
+	oldID := registerSentinelViaAPI(t, h, executorHeads()) // 201 新建（t0）
+
+	// 同坐标 force 接管（t1=+5s，仍在 15s 失活阈值内 → 活哨兵命中 force 分流）：
+	// 旧行删除、新行插入（新 id）。
+	injectFixedClock(t, sentinelT1)
+	rr := doReqWithHeaders(t, h, http.MethodPost, "/api/v1/sentinels",
+		[]byte(`{"force":true}`), executorHeads())
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("force 接管 status = %d，期望 201（body: %s）", rr.Code, rr.Body.String())
+	}
+	newID := int64(dataOf(t, rr)["sentinel_id"].(float64))
+	if newID <= 0 || newID == oldID {
+		t.Fatalf("force 接管 sentinel_id = %d，期望新 id（≠旧 id %d）", newID, oldID)
+	}
+	if n := countRows(t, st, "sentinels"); n != 1 {
+		t.Fatalf("接管后 sentinels 行数 = %d，期望 1（旧删新插）", n)
+	}
+
+	// 旧 id poll → 404 + holder 退位诊断（核心断言面）。
+	rr = pollSentinelViaAPI(t, h, oldID, "executor")
+	wantErrBody(t, rr, http.StatusNotFound, "sentinel_not_found")
+	errObj := errObjOf(t, rr)
+	if got := errObj["message"]; got != "哨兵不存在或已注销" {
+		t.Errorf("error.message = %q，期望原文案逐字不变（additive 只加键）", got)
+	}
+	holder, ok := errObj["holder"].(map[string]any)
+	if !ok {
+		t.Fatalf("404 响应缺 holder 退位诊断对象: %s", rr.Body.String())
+	}
+	if len(holder) != 3 {
+		t.Errorf("holder 键数 = %d，期望恰 session/last_ping_at/age_sec 三键（实际: %v）", len(holder), holder)
+	}
+	if got, _ := holder["session"].(string); got != "watch-a" {
+		t.Errorf("holder.session = %q，期望 watch-a（现任持有者会话名）", got)
+	}
+	if got, _ := holder["last_ping_at"].(string); got != sentinelT1 {
+		t.Errorf("holder.last_ping_at = %q，期望 %s（接管时刻——注入钟精确锚）", got, sentinelT1)
+	}
+	if age, ok := holder["age_sec"].(float64); !ok || int64(age) != 0 {
+		t.Errorf("holder.age_sec = %v，期望 0（≥0 契约；注入钟同刻接管与 poll 恒 0）", holder["age_sec"])
+	}
+}
+
+// TestPollNotFoundNoAliveHolderOmitted M-41 负面锚①：行不存在且同坐标无活哨兵
+// （注销后复 poll）→ 404 不含 holder 键（omitempty 缺省——旧客户端零感知）；
+// DELETE 端点重复注销的 404 同口径（wire 契约明确列出）。
+func TestPollNotFoundNoAliveHolderOmitted(t *testing.T) {
+	h, st := newSentinelTestServer(t)
+	_, _, _ = fixtureSentinelDomain(t, st)
+	injectFixedClock(t, sentinelT0)
+	id := registerSentinelViaAPI(t, h, executorHeads())
+
+	rr := doReqWithHeaders(t, h, http.MethodDelete, "/api/v1/sentinels/"+fID(id), nil, executorHeads())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("注销 status = %d，期望 200（body: %s）", rr.Code, rr.Body.String())
+	}
+	if n := countRows(t, st, "sentinels"); n != 0 {
+		t.Fatalf("注销后 sentinels 行数 = %d，期望 0", n)
+	}
+
+	// 同 id poll：无行且无活哨兵 → 404 且 error 不含 holder 键。
+	rr = pollSentinelViaAPI(t, h, id, "executor")
+	wantErrBody(t, rr, http.StatusNotFound, "sentinel_not_found")
+	if _, present := errObjOf(t, rr)["holder"]; present {
+		t.Errorf("无活哨兵的 404 响应含 holder 键，期望缺省（body: %s）", rr.Body.String())
+	}
+
+	// DELETE 端点重复注销 404：同样不含 holder 键。
+	rr = doReqWithHeaders(t, h, http.MethodDelete, "/api/v1/sentinels/"+fID(id), nil, executorHeads())
+	wantErrBody(t, rr, http.StatusNotFound, "sentinel_not_found")
+	if _, present := errObjOf(t, rr)["holder"]; present {
+		t.Errorf("DELETE 端点 404 响应含 holder 键，期望缺省（body: %s）", rr.Body.String())
+	}
+}
+
+// TestPollNotFoundNonNumericIDHolderOmitted M-41 负面锚②：{id} 非数字 → 解析即拒的
+// 404（未触三元组定位，无持有者可诊断）→ error 不含 holder 键。
+func TestPollNotFoundNonNumericIDHolderOmitted(t *testing.T) {
+	h, st := newSentinelTestServer(t)
+	_, _, _ = fixtureSentinelDomain(t, st)
+	injectFixedClock(t, sentinelT0)
+
+	rr := doReqWithHeaders(t, h, http.MethodPost,
+		"/api/v1/sentinels/abc/poll?column=05&role=executor&session=watch-a", nil, executorHeads())
+	wantErrBody(t, rr, http.StatusNotFound, "sentinel_not_found")
+	if _, present := errObjOf(t, rr)["holder"]; present {
+		t.Errorf("id 非数字的 404 响应含 holder 键，期望缺省（body: %s）", rr.Body.String())
+	}
+}

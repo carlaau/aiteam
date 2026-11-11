@@ -92,6 +92,36 @@ func runWatch(ctx context.Context, d watchDeps) int {
 				d.finish(ctx)
 				return 6
 			}
+			// poll 404 退位自诊断特判（v0.4.2 M-41）：双 --force 并发顶替后先发
+			// 实例的 poll 必得 404 sentinel_not_found——服务端错误体 additive 附带
+			// 现任持有者诊断（T1），client 层透传至 APIError.Holder（Error() 文本
+			// 零变化）。带 holder 时 stderr 打退位文案（现持有者+ping 年龄+--force
+			// 单窗单发纪律；文案=任务书 seq=752 原文逐字），与接管失败可区分；
+			// 无 holder（旧服务端或同坐标无活哨兵）/其余错误码/不可达 → 回落既有
+			// fail(err) 透传零变化。退出码维持 4（mapExitCode 对 APIError 的既有
+			// 映射，错误域零新增）。文案写 errOut 不直呼 os.Stderr——runWatch 纯
+			// 逻辑测试面可观测（runHitHook 同款兜底惯例）。
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) &&
+				apiErr.StatusCode == http.StatusNotFound &&
+				apiErr.Code == "sentinel_not_found" &&
+				apiErr.Holder != nil {
+				w := d.errOut
+				if w == nil {
+					w = os.Stderr
+				}
+				// 渲染侧负差钳制（b1-T2 审查建议①）：服务端钟回拨可致 age_sec 为负，
+				// 直渲染「-3s 前」误导观感——按 0 钳制渲染。与 register 200 侧
+				// AgeSec>=0 门控回落（上文 b8-W2①）有意不同：彼处回落有「--force 接管」
+				// 指引单行可依，诊断缺省无损；此处回落=退位诊断整体消失、重新变回
+				// 不可辨的透传报错，反噬 M-41 目标，故特判保留仅钳数值。
+				age := apiErr.Holder.AgeSec
+				if age < 0 {
+					age = 0
+				}
+				fmt.Fprintf(w, "哨兵已被后续挂载顶替（现持有者=%s，最后 ping %ds 前）——本进程退位；--force 纪律=单窗单发（重试/双窗/宿主任务重启再挂会互相顶替）\n", apiErr.Holder.Session, age)
+				return mapExitCode(apiErr)
+			}
 			return fail(err)
 		}
 		if len(hits) > 0 {

@@ -38,6 +38,11 @@ import (
 // 警示哲学同 M-11/b2-R3）；抽 printSessionAmbiguityHint 单点，dry-run 与
 // 实发两面一致输出（调用位紧随 printBusMisuseHint——chat/bus 三选一互斥，
 // 两提示不同时触发，输出顺序无行为差异）。
+// b2-T6 增量（M-43①）：--to-column flag 直连暴露（服务端 direct 的
+// target.column 早已支持，仅 CLI flag 面未暴露）——direct 定向目标栏目（仅与
+// --to-role 组合，缺省=发送方 --column 同栏）；组合校验（与 --to-session/--bus
+// 同给退 2 零网络）；请求体/镜像行/解析面（requestBody/mirrorLabel/overview）
+// 三口径同源切换取值。
 
 // sendMessageData 端点 #9 响应 data（§2.2 #9 恰四字段：seq/created_at/level/kind）
 // ——--json 输出直接序列化本结构，与 #9 响应同构（§4.2）。b4-T1/R1 additive
@@ -76,17 +81,20 @@ func RunSend(args []string) int {
 func runSend(ctx context.Context, args []string, serverOverride string) int {
 	fs := newFlagSet("aiteam send",
 		"用法: aiteam send (--to-role <角色> | --bus | --to-session <会话名>) "+
-			"[--to-project <项目code>] --body <text|-> "+
+			"[--to-project <项目code>] [--to-column <栏目code>] --body <text|-> "+
 			"[--level normal|important|block] [--no-mirror] [--dry-run] [--json] "+
 			"[--mirror-root <路径>] "+identityUsage)
 	var id identityFlags
-	var toRole, toSession, toProject, level, bodyFlag, mirrorRoot string
+	var toRole, toSession, toProject, toColumn, level, bodyFlag, mirrorRoot string
 	var bus, noMirror, asJSON, dryRun bool
 	registerCommonFlags(fs, &id)
-	fs.StringVar(&toRole, "to-role", "", "定向：发到 --column 栏目的该角色（三选一）")
+	// b2-T6/T8：--to-role 描述改写（--column 是身份声明兼投递落点的警示进帮助
+	// 面），--to-column flag 直连暴露（M-43①）。
+	fs.StringVar(&toRole, "to-role", "", "定向：发到 --to-column 栏目（缺省=发送方 --column 同栏）的该角色（三选一）——--column 是身份声明兼投递落点，改它=把自己注册进目标栏（一格一人红线，自锁 409）")
 	fs.BoolVar(&bus, "bus", false, "总线模式：全栏目总控可见（三选一）")
 	fs.StringVar(&toSession, "to-session", "", "会话对话：发到该会话的对话流（三选一）")
 	fs.StringVar(&toProject, "to-project", "", "跨项目：发到该项目的目标会话/角色（仅与 --to-role/--to-session 组合）")
+	fs.StringVar(&toColumn, "to-column", "", "direct 定向目标栏目（仅与 --to-role 组合；缺省=发送方 --column 同栏；跨栏目通联正路——改 --column 会把自己注册进目标栏）")
 	fs.StringVar(&level, "level", "normal", "消息分级 normal|important|block")
 	fs.StringVar(&bodyFlag, "body", "", "正文 ≤256KB；值为 - 或缺省且 stdin 非终端时自动读 stdin")
 	fs.BoolVar(&noMirror, "no-mirror", false, "跳过镜像双写（仅故障演练/测试用；默认必须双写）")
@@ -103,7 +111,7 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	if err != nil {
 		return fail(err)
 	}
-	target, err := resolveSendTarget(toRole, bus, toSession, toProject)
+	target, err := resolveSendTarget(toRole, bus, toSession, toProject, toColumn)
 	if err != nil {
 		return fail(err)
 	}
@@ -118,8 +126,8 @@ func runSend(ctx context.Context, args []string, serverOverride string) int {
 	// ①′ b4-T1/R1 目标解析全貌：三形态目标+身份+level 整理为可复用结构——
 	//    dry-run 预览（①″）与实发摘要（④）共用同一解析面（AC1④ 一致性由
 	//    此结构性保证）。解析面=参数可确定的全部信息（项目 code：跨项目=
-	//    --to-project 值、缺省/bus=发送方 --project；栏目 code：direct=发送方
-	//    --column——CLI 无 --to-column 即同栏目定向；目标格/会话=--to-role/
+	//    --to-project 值、缺省/bus=发送方 --project；栏目 code：direct=--to-column
+	//    值（缺省=发送方 --column 同栏，b2-T6/M-43①）；目标格/会话=--to-role/
 	//    --to-session 原值），服务端才可知的要素（chat 的会话所属栏目/角色
 	//    格、目标域存在性）按形态标注而非虚构——dry-run 语义=零网络。
 	resolved := target.overview(ident, level)
@@ -298,6 +306,7 @@ type sendTarget struct {
 	role    string // direct：目标角色
 	session string // chat：目标会话名
 	project string // 跨项目：目标项目 code（--to-project，b5-W3）；空=项目内（空白串视同缺省 SP2）
+	column  string // direct：目标栏目 code（--to-column，b2-T6/M-43①）；空=发送方 --column 同栏缺省
 }
 
 // resolveSendTarget 目标三选一本地校验：三者恰选其一，缺选/多选均按用法错误退 2
@@ -305,8 +314,13 @@ type sendTarget struct {
 // toProject TrimSpace 后非空且与 --bus 同给 → 用法错误退 2 不发请求（A6「--bus
 // 拒绝」——bus=发送方栏目广播，无目标项目域可锚）；校验点放在三选一计数之后，
 // 使 --to-role+--bus 等既有组合仍先落既有互斥文案（行为不变，AC9.4）。
-func resolveSendTarget(toRole string, bus bool, toSession, toProject string) (sendTarget, error) {
+// b2-T6 增量（M-43①）：toColumn 不计入三选一计数（--to-column 单给仍落既有
+// 「缺少目标参数」文案——它是 direct 形态的修饰域非独立目标）；TrimSpace 后
+// 非空且与 --to-session/--bus 同给 → 用法错误退 2 不发请求（--to-column 仅与
+// --to-role 组合；校验点同样在三选一计数之后，既有互斥文案优先）。
+func resolveSendTarget(toRole string, bus bool, toSession, toProject, toColumn string) (sendTarget, error) {
 	role, sess, proj := strings.TrimSpace(toRole), strings.TrimSpace(toSession), strings.TrimSpace(toProject)
+	col := strings.TrimSpace(toColumn)
 	chosen := 0
 	for _, set := range []bool{role != "", bus, sess != ""} {
 		if set {
@@ -323,9 +337,15 @@ func resolveSendTarget(toRole string, bus bool, toSession, toProject string) (se
 	if proj != "" && bus {
 		return sendTarget{}, fmt.Errorf("%w: --to-project 仅与 --to-role/--to-session 组合（--bus 是发送方栏目广播，不支持跨项目）", ErrUsage)
 	}
+	if col != "" && sess != "" {
+		return sendTarget{}, fmt.Errorf("%w: --to-column 仅与 --to-role 组合（direct 定向目标栏目；与 --to-session/--bus 同给属用法错误）", ErrUsage)
+	}
+	if col != "" && bus {
+		return sendTarget{}, fmt.Errorf("%w: --to-column 仅与 --to-role 组合（--bus 是发送方栏目广播，无目标栏目可锚）", ErrUsage)
+	}
 	switch {
 	case role != "":
-		return sendTarget{kind: store.MessageKindDirect, role: role, project: proj}, nil
+		return sendTarget{kind: store.MessageKindDirect, role: role, project: proj, column: col}, nil
 	case bus:
 		return sendTarget{kind: store.MessageKindBus}, nil
 	default:
@@ -334,10 +354,10 @@ func resolveSendTarget(toRole string, bus bool, toSession, toProject string) (se
 }
 
 // requestBody 组装 #9 请求 target（§2.2 #9 三形态原文）：direct 的 target.column
-// 取发送方 --column（§4.2「--to-role：定向：发到 --column 栏目的该角色」——CLI
-// flag 面无独立 --to-column，即同栏目定向）；bus 无目标参数；chat 带目标会话名。
-// b5-W3：toProject 非空（跨项目）时增 project 键（§2.3；显式=发送方自身时服务端
-// 按项目内路径处理 SP1，键无害透传）。
+// 取 --to-column 值（b2-T6/M-43① 直连暴露；缺省=发送方 --column 同栏——跨栏目
+// 通联走 --to-column 而非改 --column，后者=把自己注册进目标栏）；bus 无目标
+// 参数；chat 带目标会话名。b5-W3：toProject 非空（跨项目）时增 project 键
+// （§2.3；显式=发送方自身时服务端按项目内路径处理 SP1，键无害透传）。
 func (t sendTarget) requestBody(ident client.Identity) map[string]any {
 	m := map[string]any{"kind": t.kind}
 	if t.project != "" {
@@ -345,7 +365,11 @@ func (t sendTarget) requestBody(ident client.Identity) map[string]any {
 	}
 	switch t.kind {
 	case store.MessageKindDirect:
-		m["column"] = ident.Column
+		col := ident.Column
+		if t.column != "" {
+			col = t.column
+		}
+		m["column"] = col
 		m["role"] = t.role
 	case store.MessageKindChat:
 		m["session"] = t.session
@@ -356,8 +380,9 @@ func (t sendTarget) requestBody(ident client.Identity) map[string]any {
 // mirrorLabel 镜像行目标摘要（§8.2 行格式第 4 字段三形态示例）：
 // direct=proj-a/05/executor、bus=BUS、chat=session:<会话名>。b5-W3/SP3：direct
 // 跨项目摘要=目标项目 code 前缀（真实落点语义——显式指定自身项目时前缀与
-// ident.Project 同值，字符串形态不变）；bus/chat 摘要不带项目域（chat 定点到
-// 会话名、bus 无目标域），维持既有形态。
+// ident.Project 同值，字符串形态不变）；b2-T6：栏目段取 --to-column 值（缺省=
+// 发送方 --column，与 requestBody 落点口径同源）；bus/chat 摘要不带项目域
+// （chat 定点到会话名、bus 无目标域），维持既有形态。
 func (t sendTarget) mirrorLabel(ident client.Identity) string {
 	switch t.kind {
 	case store.MessageKindDirect:
@@ -365,7 +390,11 @@ func (t sendTarget) mirrorLabel(ident client.Identity) string {
 		if t.project != "" {
 			proj = t.project
 		}
-		return proj + "/" + ident.Column + "/" + t.role
+		col := ident.Column
+		if t.column != "" {
+			col = t.column
+		}
+		return proj + "/" + col + "/" + t.role
 	case store.MessageKindBus:
 		return "BUS"
 	default:
@@ -386,7 +415,7 @@ func (t sendTarget) mirrorLabel(ident client.Identity) string {
 type sendResolvedTarget struct {
 	Kind    string `json:"kind"`              // direct / bus / chat（#9 target.kind 同枚举）
 	Project string `json:"project"`           // 目标项目 code：跨项目=--to-project 值；项目内/bus=发送方 --project
-	Column  string `json:"column,omitempty"`  // direct=发送方 --column（同栏目定向，CLI 无 --to-column）；bus/chat 键缺省
+	Column  string `json:"column,omitempty"`  // direct=--to-column 值（缺省=发送方 --column 同栏）；bus/chat 键缺省
 	Role    string `json:"role,omitempty"`    // direct=--to-role 值；bus=controller（广播唯一投递格，b2-R3 提示同口径）；chat 键缺省
 	Session string `json:"session,omitempty"` // chat=--to-session 值；direct/bus 键缺省
 	Level   string `json:"level"`             // 消息分级（--level，本地白名单已过）
@@ -394,7 +423,8 @@ type sendResolvedTarget struct {
 
 // overview 目标三形态 → 解析全貌构造。项目段与 mirrorLabel 同口径：跨项目取
 // --to-project 值、缺省取发送方项目（bus 恒发送方项目——--to-project+--bus 已
-// 在 resolveSendTarget 退 2 拒绝，无跨项目 bus 路径）。
+// 在 resolveSendTarget 退 2 拒绝，无跨项目 bus 路径）；栏目段与 requestBody/
+// mirrorLabel 同口径：direct 取 --to-column 值、缺省发送方 --column（b2-T6）。
 func (t sendTarget) overview(ident client.Identity, level string) sendResolvedTarget {
 	proj := ident.Project
 	if t.project != "" {
@@ -404,6 +434,9 @@ func (t sendTarget) overview(ident client.Identity, level string) sendResolvedTa
 	switch t.kind {
 	case store.MessageKindDirect:
 		rt.Column = ident.Column
+		if t.column != "" {
+			rt.Column = t.column
+		}
 		rt.Role = t.role
 	case store.MessageKindBus:
 		rt.Role = "controller"

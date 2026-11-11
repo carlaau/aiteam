@@ -1164,3 +1164,122 @@ func TestWatchIntegrationForceTakeover(t *testing.T) {
 	}
 	assertNoSentinelRows(t, st)
 }
+
+// ───────────────────────── b1-T2 poll 404 退位文案（M-41 CLI 消费面） ─────────────────────────
+//
+// 桩层：register 201 → poll 一律 404 的两态桩（错误体带/不带 holder 键）。
+// TDD 红笔：CLI 侧退位文案尚未实现（断言红非编译红）——带 holder 期望退位文案
+// 缺失即 FAIL；无 holder 锁定既有透传文案零回归（既有行为本就在，PASS）。
+
+// watchPoll404StubServer poll 404 桩：POST /api/v1/sentinels 一律 201（regData 固定
+// 响应体，watch 进轮询循环）；POST .../poll 一律 pollStatus（pollBody 固定响应体——
+// 带/不带 holder 两态由调用方注入）；其余请求=预期外路径即报错（poll 404 走 fail
+// 透传不收尾，不应有 DELETE 等第三种请求到达）。
+func watchPoll404StubServer(t *testing.T, regData, pollBody string, pollStatus int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sentinels":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(regData))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/poll"):
+			w.WriteHeader(pollStatus)
+			_, _ = w.Write([]byte(pollBody))
+		default:
+			t.Errorf("预期外请求: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+}
+
+// TestWatchPoll404RetireMessage b1-T2①（M-41）：双 --force 并发顶替后先发实例的
+// 可观测面——注册 201 进循环，下次 poll 得 404 sentinel_not_found 且错误体附 holder
+// → stderr 打退位文案（现持有者会话名+ping 年龄+--force 单窗单发纪律），与接管
+// 失败可区分；退出码维持 4（错误域零新增），既有「服务端错误（HTTP 404）」透传
+// 形状在带 holder 时不再出现。
+func TestWatchPoll404RetireMessage(t *testing.T) {
+	ts := watchPoll404StubServer(t,
+		`{"data":{"sentinel_id":9,"interval_sec":5}}`,
+		`{"error":{"code":"sentinel_not_found","message":"哨兵不存在或已注销",`+
+			`"holder":{"session":"watch-new","last_ping_at":"2026-10-02T13:00:00Z","age_sec":3}}}`,
+		http.StatusNotFound)
+	t.Cleanup(ts.Close)
+	stdout, stderr := runWantCode(t, "watch poll 404 退位", 4, func() int {
+		return runWatchCmd(context.Background(), regIdentityArgs(), ts.URL, nil)
+	})
+	for _, want := range []string{
+		"哨兵已被后续挂载顶替",
+		"现持有者=watch-new",
+		"最后 ping 3s 前",
+		"本进程退位",
+		"--force 纪律=单窗单发",
+		"互相顶替",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("退位 stderr = %q，期望含 %q", stderr, want)
+		}
+	}
+	// 任务书模板一词不差锚（%s=watch-new、%d=3 渲染后全句连续出现）。
+	wantFull := "哨兵已被后续挂载顶替（现持有者=watch-new，最后 ping 3s 前）——本进程退位；--force 纪律=单窗单发（重试/双窗/宿主任务重启再挂会互相顶替）"
+	if !strings.Contains(stderr, wantFull) {
+		t.Errorf("退位 stderr = %q，期望含完整模板 %q", stderr, wantFull)
+	}
+	if strings.Contains(stderr, "服务端错误（HTTP 404）") {
+		t.Errorf("退位 stderr = %q，带 holder 不应回落既有透传形状「服务端错误（HTTP 404）」", stderr)
+	}
+	if strings.Contains(stdout, "服务端错误（HTTP 404）") {
+		t.Errorf("退位 stdout = %q，不应出既有透传形状（防双路打印）", stdout)
+	}
+}
+
+// TestWatchPoll404NoHolderLegacyMessage b1-T2②（M-41 兼容面）：poll 404 错误体无
+// holder 键（旧服务端/无顶替场景）→ 既有透传文案零回归（code+message 原样），
+// 退出码维持 4，不出退位字样（holder 缺省即无退位诊断）。
+func TestWatchPoll404NoHolderLegacyMessage(t *testing.T) {
+	ts := watchPoll404StubServer(t,
+		`{"data":{"sentinel_id":9,"interval_sec":5}}`,
+		`{"error":{"code":"sentinel_not_found","message":"哨兵不存在或已注销"}}`,
+		http.StatusNotFound)
+	t.Cleanup(ts.Close)
+	_, stderr := runWantCode(t, "watch poll 404 无 holder 回落", 4, func() int {
+		return runWatchCmd(context.Background(), regIdentityArgs(), ts.URL, nil)
+	})
+	for _, want := range []string{
+		"服务端错误（HTTP 404）",
+		"sentinel_not_found",
+		"哨兵不存在或已注销",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("回落 stderr = %q，期望含 %q（既有文案不回归）", stderr, want)
+		}
+	}
+	if strings.Contains(stderr, "退位") {
+		t.Errorf("回落 stderr = %q，无 holder 不应出退位文案", stderr)
+	}
+}
+
+// TestWatchPoll404NegativeAgeSecClamp b1-T2 审查建议①（M-41 渲染面防御）：服务端钟
+// 回拨时 holder.age_sec 可为负——退位文案渲染侧钳制按 0 渲染（「最后 ping 0s 前」），
+// 不得直渲染负值（「-3s 前」误导观感）；特判本身保留不回落透传（回落=退位诊断整体
+// 消失重新变回不可辨报错，反噬 M-41——与 register 200 侧 AgeSec>=0 门控回落的差异
+// 及理由见 runWatch 特判处注释）。
+func TestWatchPoll404NegativeAgeSecClamp(t *testing.T) {
+	ts := watchPoll404StubServer(t,
+		`{"data":{"sentinel_id":9,"interval_sec":5}}`,
+		`{"error":{"code":"sentinel_not_found","message":"哨兵不存在或已注销",`+
+			`"holder":{"session":"watch-new","last_ping_at":"2026-10-02T13:00:00Z","age_sec":-3}}}`,
+		http.StatusNotFound)
+	t.Cleanup(ts.Close)
+	_, stderr := runWantCode(t, "watch poll 404 负差钳制", 4, func() int {
+		return runWatchCmd(context.Background(), regIdentityArgs(), ts.URL, nil)
+	})
+	if !strings.Contains(stderr, "最后 ping 0s 前") {
+		t.Errorf("退位 stderr = %q，期望负差按 0 渲染（含 %q）", stderr, "最后 ping 0s 前")
+	}
+	if strings.Contains(stderr, "-3s") {
+		t.Errorf("退位 stderr = %q，不应直渲染负值 age_sec", stderr)
+	}
+	if !strings.Contains(stderr, "现持有者=watch-new") {
+		t.Errorf("退位 stderr = %q，期望退位特判保留（含 %q）", stderr, "现持有者=watch-new")
+	}
+}
